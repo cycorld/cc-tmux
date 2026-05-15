@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-label="Animated cc-tmux terminal demo">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#1f2937"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; }
+      .muted { fill: #8b949e; }
+      .green { fill: #3fb950; }
+      .blue { fill: #58a6ff; }
+      .yellow { fill: #f2cc60; }
+      .white { fill: #c9d1d9; }
+      .prompt { fill: #ff7b72; }
+      @keyframes blink { 0%, 45% { opacity: 1 } 46%, 100% { opacity: 0 } }
+      @keyframes line2 { 0%, 20% { opacity: 0 } 25%, 100% { opacity: 1 } }
+      @keyframes line3 { 0%, 38% { opacity: 0 } 43%, 100% { opacity: 1 } }
+      @keyframes line4 { 0%, 56% { opacity: 0 } 61%, 100% { opacity: 1 } }
+      @keyframes line5 { 0%, 74% { opacity: 0 } 79%, 100% { opacity: 1 } }
+      .l2 { animation: line2 7s infinite; }
+      .l3 { animation: line3 7s infinite; }
+      .l4 { animation: line4 7s infinite; }
+      .l5 { animation: line5 7s infinite; }
+      .cursor { animation: blink 1s infinite; }
+    </style>
+  </defs>
+  <rect width="960" height="540" rx="24" fill="url(#bg)"/>
+  <rect x="60" y="50" width="840" height="440" rx="14" fill="#010409" stroke="#30363d"/>
+  <circle cx="90" cy="78" r="8" fill="#ff5f56"/>
+  <circle cx="118" cy="78" r="8" fill="#ffbd2e"/>
+  <circle cx="146" cy="78" r="8" fill="#27c93f"/>
+  <text x="480" y="84" text-anchor="middle" class="mono muted" font-size="16">cc-tmux orchestrating Claude Code</text>
+
+  <text x="88" y="132" class="mono prompt" font-size="22">$</text>
+  <text x="118" y="132" class="mono white" font-size="22">cc-tmux start ~/project --prompt "add tests"</text>
+
+  <text x="88" y="178" class="mono green l2" font-size="22">created session: cc-tmux-project-a41f2</text>
+  <text x="88" y="224" class="mono blue l3" font-size="22">Claude Code runs in tmux; prompts are sent with send-keys</text>
+  <text x="88" y="270" class="mono white l4" font-size="22">$ cc-tmux status ~/project --json</text>
+  <text x="88" y="316" class="mono yellow l4" font-size="22">{ "exists": true, "done": false, "session": "cc-tmux-project-a41f2" }</text>
+  <text x="88" y="362" class="mono white l5" font-size="22">$ cc-tmux capture ~/project -n 20</text>
+  <text x="88" y="408" class="mono green l5" font-size="22">✓ edits accepted, tests running, ready for next instruction</text>
+  <rect x="88" y="432" width="13" height="25" class="cursor" fill="#c9d1d9"/>
+</svg>
