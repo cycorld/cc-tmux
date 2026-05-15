@@ -53,8 +53,8 @@ class Tmux:
         return self.run(["has-session", "-t", session_name], check=False).returncode == 0
 
     def new_session(self, session_name: str, cwd: Path, command: list[str]) -> None:
-        # tmux new-session accepts one command string. Use tmux's argv for safety around tmux options
-        # and quote the program command with shlex only at this boundary.
+        # tmux new-session accepts one command string. Use tmux's argv for safety
+        # around tmux options and quote the program command only at this boundary.
         import shlex
 
         command_string = " ".join(shlex.quote(part) for part in command)
@@ -62,6 +62,11 @@ class Tmux:
 
     def send_keys(self, target: str, *keys: str) -> None:
         self.run(["send-keys", "-t", target, *keys])
+
+    def send_text(self, target: str, text: str, *, enter: bool = True) -> None:
+        self.run(["send-keys", "-t", target, "-l", text])
+        if enter:
+            self.send_keys(target, "Enter")
 
     def capture(self, target: str, lines: int = 80, ansi: bool = False) -> str:
         args = ["capture-pane", "-t", target, "-p", "-S", f"-{lines}"]
@@ -132,10 +137,9 @@ def resolve_session(identifier: str, tmux: Tmux | None = None) -> str:
 
 
 def prompt_done_heuristic(capture: str) -> bool:
-    stripped = capture.strip()
-    if not stripped:
+    if not capture.strip():
         return False
-    tail = "\n".join(stripped.splitlines()[-8:])
+    tail = "\n".join(capture.splitlines()[-8:])
     return any(marker in tail for marker in _DONE_MARKERS)
 
 

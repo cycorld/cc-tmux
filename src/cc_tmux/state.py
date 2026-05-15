@@ -18,7 +18,7 @@ class SessionRecord:
     created_at: str
 
     @classmethod
-    def create(cls, project_path: Path, session_name: str) -> "SessionRecord":
+    def create(cls, project_path: Path, session_name: str) -> SessionRecord:
         return cls(
             project_path=str(project_path.resolve()),
             session_name=session_name,
@@ -59,7 +59,11 @@ def upsert_record(record: SessionRecord, path: Path = STATE_FILE) -> None:
 
 def remove_record(session_name: str, path: Path = STATE_FILE) -> None:
     records = load_state(path)
-    to_remove = [key for key, value in records.items() if value.session_name == session_name or key == session_name]
+    to_remove = [
+        key
+        for key, value in records.items()
+        if value.session_name == session_name or key == session_name
+    ]
     for key in to_remove:
         records.pop(key, None)
     save_state(records, path)

@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from cc_tmux.tmux import CCTmuxError, Tmux, claude_command, normalize_session_name, prompt_done_heuristic, resolve_session, slugify_project
+from cc_tmux.tmux import (
+    CCTmuxError,
+    Tmux,
+    claude_command,
+    normalize_session_name,
+    prompt_done_heuristic,
+    resolve_session,
+    slugify_project,
+)
 
 
 class FakeTmux(Tmux):
@@ -10,7 +18,13 @@ class FakeTmux(Tmux):
         self.live = live or set()
         self.calls: list[list[str]] = []
 
-    def run(self, args: list[str], *, check: bool = True, text: bool = True):  # pragma: no cover - not used
+    def run(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        text: bool = True,
+    ):  # pragma: no cover - not used
         self.calls.append(args)
         raise AssertionError("run should not be called in these tests")
 
@@ -46,6 +60,21 @@ def test_claude_command_constructs_argv_without_shell():
         "sonnet",
     ]
     assert claude_command(None, []) == ["claude"]
+
+
+def test_send_text_uses_literal_mode_then_enter(monkeypatch):
+    tmux = Tmux()
+    calls = []
+
+    def fake_run(args, *, check=True, text=True):
+        calls.append(args)
+
+    monkeypatch.setattr(tmux, "run", fake_run)
+    tmux.send_text("session:0.0", "hello; rm -rf /")
+    assert calls == [
+        ["send-keys", "-t", "session:0.0", "-l", "hello; rm -rf /"],
+        ["send-keys", "-t", "session:0.0", "Enter"],
+    ]
 
 
 def test_resolve_session_prefers_live_prefixed_name():
