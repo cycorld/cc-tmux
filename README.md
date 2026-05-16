@@ -97,7 +97,7 @@ Sends text plus `Enter` to the Claude pane.
 cc-tmux send api-fix "Run pytest and fix failures."
 ```
 
-If Claude is actively working, interrupt first and wait until the input prompt is visible before sending a follow-up. Live testing showed `Escape` interrupts an active Claude Code task; sending the next prompt too early can append it to the prior input line.
+If Claude is actively working, interrupt first and wait until the input prompt is visible before sending a follow-up. Live testing showed `Escape` interrupts an active Claude Code task; sending the next prompt too early can append it to the prior input line. `interrupt` clears any stale input with `C-u` and waits a short settle period by default before returning.
 
 ```bash
 cc-tmux interrupt api-fix --wait-ready 10
@@ -124,6 +124,8 @@ Options:
 
 - `--key KEY`: tmux key name to send instead of `Escape`, for example `C-c`.
 - `--wait-ready SECONDS`: after sending the key, poll `status` until `last_prompt_ready` is true or the timeout expires.
+- `--clear-input` / `--no-clear-input`: send `C-u` after interruption/readiness to clear stale input. Default: enabled.
+- `--settle SECONDS`: short delay after cleanup before returning, so immediate follow-up sends do not lose their first character. Default: 0.3.
 
 Recommended follow-up workflow:
 
@@ -213,7 +215,7 @@ cc-tmux send api-fix "/btw Is the current task blocked? Answer briefly."
 - `tmux binary not found`: install tmux and ensure it is on `PATH`.
 - `claude binary not found`: install Claude Code and verify `claude --version` works in the same shell.
 - Workspace trust prompt blocks progress: run `cc-tmux trust <session>` or use the default `--auto-trust` behavior.
-- Need to interrupt a busy turn: run `cc-tmux interrupt <session> --wait-ready 10`, confirm `last_prompt_ready: true`, then use `cc-tmux send` for the follow-up. If readiness times out, inspect with `cc-tmux capture <session> -n 120` before sending more text.
+- Need to interrupt a busy turn: run `cc-tmux interrupt <session> --wait-ready 10`, confirm `last_prompt_ready: true`, then use `cc-tmux send` for the follow-up. The interrupt command clears stale input and settles briefly by default to avoid dropping the first follow-up character. If readiness times out, inspect with `cc-tmux capture <session> -n 120` before sending more text.
 - Overlay or slash-command panel stuck open: run `cc-tmux key <session> Escape`.
 - Status says `exists: false`: check `tmux list-sessions` and `cc-tmux list --json`.
 - ANSI-heavy output: prefer `cc-tmux capture --no-ansi`; control-mode streams can be noisy.

@@ -100,11 +100,17 @@ def _wait_for_prompt_ready(identifier: str, *, timeout: float, interval: float =
 def cmd_interrupt(args: argparse.Namespace) -> int:
     tmux = Tmux()
     session = resolve_session(args.session_or_project, tmux)
-    tmux.send_keys(f"{session}:0.0", args.key)
+    target = f"{session}:0.0"
+    tmux.send_keys(target, args.key)
     print(f"sent interrupt key to {session}: {args.key}")
     if args.wait_ready is not None:
         ready = _wait_for_prompt_ready(session, timeout=args.wait_ready)
         print(f"last_prompt_ready: {str(ready).lower()}")
+    if args.clear_input:
+        tmux.send_keys(target, "C-u")
+        print(f"cleared input line for {session}: C-u")
+    if args.settle > 0:
+        time.sleep(args.settle)
     return 0
 
 
@@ -330,6 +336,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help="poll status until last_prompt_ready or timeout before returning",
+    )
+    p.add_argument(
+        "--clear-input",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "send C-u after interruption/readiness to clear any stale input line. "
+            "Default: enabled"
+        ),
+    )
+    p.add_argument(
+        "--settle",
+        type=float,
+        default=0.3,
+        metavar="SECONDS",
+        help="sleep briefly after interrupt cleanup before returning. Default: 0.3",
     )
     p.set_defaults(func=cmd_interrupt)
 

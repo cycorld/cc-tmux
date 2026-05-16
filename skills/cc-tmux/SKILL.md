@@ -31,7 +31,7 @@ Send work:
 cc-tmux send project-worker "Implement the requested change, run tests, and summarize results."
 ```
 
-Interrupt a busy turn before changing direction:
+Interrupt a busy turn before changing direction. This is the recommended follow-up workflow: `interrupt` waits for readiness, clears stale input with `C-u`, and settles briefly by default before returning so the next `send` is not appended to the old line or missing its first character.
 
 ```bash
 cc-tmux interrupt project-worker --wait-ready 10
@@ -79,7 +79,7 @@ Pitfalls:
 
 - Do not assume `/workspace`; pass the real repository path.
 - If Claude shows a trust prompt, run `cc-tmux trust hermes-app`.
-- If Claude is busy and the operator needs to redirect it, run `cc-tmux interrupt hermes-app --wait-ready 10` first, then send the follow-up with `cc-tmux send`. Sending follow-ups too early can append text to an old input line.
+- If Claude is busy and the operator needs to redirect it, run `cc-tmux interrupt hermes-app --wait-ready 10` first, then send the follow-up with `cc-tmux send`. This default interrupt flow clears stale input and briefly settles before returning; sending follow-ups without it can append text to an old input line or lose the first character.
 - Close Claude Code overlays and side panels with `cc-tmux key hermes-app Escape`.
 - Capture output is for status, not a formal API contract.
 

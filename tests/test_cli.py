@@ -37,11 +37,20 @@ def test_parser_key_accepts_multiple_keys():
     assert args.keys == ["Escape", "C-c", "Enter"]
 
 
-def test_parser_interrupt_defaults_to_escape():
+def test_parser_interrupt_defaults_to_escape_and_cleanup():
     parser = build_parser()
     args = parser.parse_args(["interrupt", "demo"])
     assert args.key == "Escape"
     assert args.wait_ready is None
+    assert args.clear_input is True
+    assert args.settle == 0.3
+
+
+def test_parser_interrupt_can_disable_clear_and_settle():
+    parser = build_parser()
+    args = parser.parse_args(["interrupt", "demo", "--no-clear-input", "--settle", "0"])
+    assert args.clear_input is False
+    assert args.settle == 0
 
 
 def test_help_exits_success(capsys):
@@ -100,28 +109,50 @@ def test_key_command_sends_tmux_keys_without_shell(monkeypatch, capsys):
     assert "sent keys to cc-tmux-demo: Escape C-c Enter" in captured.out
 
 
-def test_interrupt_sends_default_escape_and_waits_ready(monkeypatch, capsys):
+def test_interrupt_sends_default_escape_waits_ready_clears_and_settles(monkeypatch, capsys):
     FakeCliTmux.sent_keys = []
     FakeCliTmux.captures = ["working...", "│ ❯ "]
+    sleeps = []
     monkeypatch.setattr(cli, "Tmux", FakeCliTmux)
-    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     exit_code = main(["interrupt", "demo", "--wait-ready", "1"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert FakeCliTmux.sent_keys == [("cc-tmux-demo:0.0", ("Escape",))]
+    assert FakeCliTmux.sent_keys == [
+        ("cc-tmux-demo:0.0", ("Escape",)),
+        ("cc-tmux-demo:0.0", ("C-u",)),
+    ]
+    assert sleeps[-1] == 0.3
     assert "sent interrupt key to cc-tmux-demo: Escape" in captured.out
     assert "last_prompt_ready: true" in captured.out
+    assert "cleared input line for cc-tmux-demo: C-u" in captured.out
 
 
 def test_interrupt_can_use_custom_key(monkeypatch, capsys):
     FakeCliTmux.sent_keys = []
     monkeypatch.setattr(cli, "Tmux", FakeCliTmux)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
     exit_code = main(["interrupt", "demo", "--key", "C-c"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert FakeCliTmux.sent_keys == [("cc-tmux-demo:0.0", ("C-c",))]
+    assert FakeCliTmux.sent_keys == [
+        ("cc-tmux-demo:0.0", ("C-c",)),
+        ("cc-tmux-demo:0.0", ("C-u",)),
+    ]
     assert "sent interrupt key to cc-tmux-demo: C-c" in captured.out
+
+
+def test_interrupt_can_skip_clear_and_settle(monkeypatch, capsys):
+    FakeCliTmux.sent_keys = []
+    monkeypatch.setattr(cli, "Tmux", FakeCliTmux)
+
+    exit_code = main(["interrupt", "demo", "--no-clear-input", "--settle", "0"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert FakeCliTmux.sent_keys == [("cc-tmux-demo:0.0", ("Escape",))]
+    assert "cleared input line" not in captured.out
