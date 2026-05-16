@@ -270,7 +270,41 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Limitations: server mode is an MVP. `stream=true` returns `501`, authentication is not built in, requests are synchronous, and chat completion content is a cleaned transcript tail rather than a structured model answer. `wait_ready` waits for the captured pane to show a new turn lifecycle (screen changes, non-ready/busy state, then ready prompt again), but it remains a tmux/TUI heuristic rather than a formal Claude Code completion signal. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
+Streaming and operator endpoints:
+
+```bash
+# Server-sent session events: status, capture_delta, and decision_required.
+curl -N 'http://127.0.0.1:19410/v1/sessions/app-worker/events?interval=1.0&n=120'
+
+# Plan approval decisions, if Claude is paused at the approval UI.
+curl http://127.0.0.1:19410/v1/sessions/app-worker/decisions
+curl -X POST http://127.0.0.1:19410/v1/sessions/app-worker/decisions \
+  -H 'content-type: application/json' \
+  -d '{"decision_id":"plan_approval","option":"2"}'
+
+# Git artifact summary for the session project.
+curl http://127.0.0.1:19410/v1/sessions/app-worker/artifacts
+```
+
+OpenAI-compatible streaming works with `stream=true`; chunks contain transcript capture deltas in `choices[0].delta.content` and then `[DONE]`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="unused")
+stream = client.chat.completions.create(
+    model="cc-tmux",
+    messages=[{"role": "user", "content": "Run pytest and summarize."}],
+    stream=True,
+    extra_body={"metadata": {"project_path": "/srv/repos/app", "session": "app-worker"}},
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="")
+```
+
+Limitations: server mode is still an MVP. Authentication is not built in, chat completion content is a cleaned transcript tail/capture delta rather than a structured model answer, and readiness is based on tmux/TUI screen heuristics. Plan-decision posting sends the raw option key (`1`-`4`) plus `Enter`; option `4` feedback is best-effort because Claude's focused TUI can change across versions. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
 
 ## State file
 

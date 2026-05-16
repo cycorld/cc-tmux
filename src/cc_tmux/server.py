@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,49 @@ from .tmux import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 19410
+PLAN_APPROVAL_DECISION = {
+    "id": "plan_approval",
+    "kind": "plan_approval",
+    "prompt": "Claude has written up a plan and is waiting for approval.",
+    "options": [
+        {"id": "1", "label": "Yes, auto-accept edits"},
+        {"id": "2", "label": "Yes, manually approve edits"},
+        {"id": "3", "label": "No, keep planning"},
+        {"id": "4", "label": "Provide feedback"},
+    ],
+    "recommended_option": "2",
+}
+
+
+def derive_state(status: dict[str, Any]) -> str:
+    if not bool(status.get("exists")):
+        return "stopped"
+    if bool(status.get("awaiting_plan_approval")):
+        return "awaiting_plan_approval"
+    if bool(status.get("plan_mode")):
+        return "plan_mode"
+    if bool(status.get("last_prompt_ready")):
+        return "idle"
+    return "running"
+
+
+def with_state(status: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(status)
+    payload["state"] = derive_state(payload)
+    return payload
+
+
+def sse_format(event: str, data: Any) -> str:
+    encoded = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {encoded}\n\n"
+
+
+def _capture_delta(previous: str, current: str) -> str:
+    if not previous:
+        return current
+    if current.startswith(previous):
+        return current[len(previous) :]
+    return current if current != previous else ""
 
 
 class CCTmuxService:
@@ -123,34 +169,38 @@ class CCTmuxService:
             session = resolve_session(session_id, self.tmux)
         except CCTmuxError:
             session = session_id if session_id.startswith("cc-tmux-") else f"cc-tmux-{session_id}"
-            return {
+            return with_state(
+                {
+                    "identifier": session_id,
+                    "session_id": session,
+                    "name": session,
+                    "session": session,
+                    "exists": False,
+                    "done": False,
+                    "last_prompt_ready": False,
+                    "plan_mode": False,
+                    "awaiting_plan_approval": False,
+                    "plan_file": None,
+                    "capture": "",
+                }
+            )
+        exists = self.tmux.has_session(session)
+        capture = self.tmux.capture(f"{session}:0.0", lines=lines) if exists else ""
+        return with_state(
+            {
                 "identifier": session_id,
                 "session_id": session,
                 "name": session,
                 "session": session,
-                "exists": False,
-                "done": False,
-                "last_prompt_ready": False,
-                "plan_mode": False,
-                "awaiting_plan_approval": False,
-                "plan_file": None,
-                "capture": "",
+                "exists": exists,
+                "done": prompt_done_heuristic(capture),
+                "last_prompt_ready": prompt_ready_heuristic(capture),
+                "plan_mode": plan_mode_heuristic(capture),
+                "awaiting_plan_approval": awaiting_plan_approval_heuristic(capture),
+                "plan_file": plan_file_heuristic(capture),
+                "capture": capture,
             }
-        exists = self.tmux.has_session(session)
-        capture = self.tmux.capture(f"{session}:0.0", lines=lines) if exists else ""
-        return {
-            "identifier": session_id,
-            "session_id": session,
-            "name": session,
-            "session": session,
-            "exists": exists,
-            "done": prompt_done_heuristic(capture),
-            "last_prompt_ready": prompt_ready_heuristic(capture),
-            "plan_mode": plan_mode_heuristic(capture),
-            "awaiting_plan_approval": awaiting_plan_approval_heuristic(capture),
-            "plan_file": plan_file_heuristic(capture),
-            "capture": capture,
-        }
+        )
 
     def capture(self, session_id: str, *, lines: int = 120, ansi: bool = False) -> dict[str, Any]:
         session = resolve_session(session_id, self.tmux)
@@ -219,6 +269,96 @@ class CCTmuxService:
         self.tmux.send_keys(f"{session}:0.0", *keys)
         return {"session_id": session, "name": session, "session": session, "keys": keys}
 
+    def decisions(self, session_id: str) -> list[dict[str, Any]]:
+        status = self.status(session_id, lines=120)
+        if not bool(status.get("awaiting_plan_approval")):
+            return []
+        decision = dict(PLAN_APPROVAL_DECISION)
+        decision["session_id"] = status.get("session_id", session_id)
+        if status.get("plan_file"):
+            decision["plan_file"] = status["plan_file"]
+        return [decision]
+
+    def post_decision(
+        self,
+        session_id: str,
+        *,
+        decision_id: str,
+        option: str,
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        if decision_id != "plan_approval":
+            raise CCTmuxError(f"unsupported decision_id: {decision_id}")
+        if option not in {"1", "2", "3", "4"}:
+            raise CCTmuxError("option must be one of: 1, 2, 3, 4")
+        keys = [option, "Enter"]
+        if option == "4" and feedback:
+            keys.append(feedback)
+            keys.append("Enter")
+        sent = self.send_keys(session_id, keys=keys)
+        return {
+            "session_id": sent["session_id"],
+            "name": sent["name"],
+            "session": sent["session"],
+            "decision_id": decision_id,
+            "option": option,
+            "feedback_sent": bool(option == "4" and feedback),
+            "keys": keys,
+        }
+
+    def artifacts(
+        self, session_id: str | None = None, *, project_path: str | None = None
+    ) -> dict[str, Any]:
+        if project_path is None and session_id is not None:
+            for record in known_records():
+                if record.session_name == session_id:
+                    project_path = record.project_path
+                    break
+        payload: dict[str, Any] = {
+            "session_id": session_id,
+            "project_path": project_path,
+            "git_status_short": "",
+            "changed_files": [],
+            "diff_stat": "",
+        }
+        if not project_path:
+            payload["error"] = "project_path unknown"
+            return payload
+        project = Path(project_path).expanduser().resolve()
+        payload["project_path"] = str(project)
+        if not project.exists() or not project.is_dir():
+            payload["error"] = "project_path is not a directory"
+            return payload
+        if not (project / ".git").exists():
+            payload["error"] = "not a git repository"
+            return payload
+        try:
+            status = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=project,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.rstrip()
+            diff_stat = subprocess.run(
+                ["git", "diff", "--stat"],
+                cwd=project,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.rstrip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            payload["error"] = str(exc)
+            return payload
+        payload["git_status_short"] = status
+        payload["changed_files"] = [
+            _status_path(line) for line in status.splitlines() if line.strip()
+        ]
+        payload["diff_stat"] = diff_stat
+        return payload
+
     def stop_session(self, session_id: str, *, wait_seconds: float = 3.0) -> dict[str, Any]:
         session = resolve_session(session_id, self.tmux)
         target = f"{session}:0.0"
@@ -242,13 +382,9 @@ class CCTmuxService:
             "graceful": graceful,
         }
 
-    def chat_completion(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    def _resolve_chat_target(
+        self, messages: list[dict[str, Any]], metadata: dict[str, Any] | None
+    ) -> tuple[str, str, dict[str, Any]]:
         metadata = metadata or {}
         content = _last_user_content(messages)
         if not content:
@@ -256,6 +392,7 @@ class CCTmuxService:
 
         session = metadata.get("session") or metadata.get("session_id")
         project_path = metadata.get("project_path")
+        started: dict[str, Any] = {}
         if project_path:
             started = self.start_session(
                 project_path=str(project_path),
@@ -267,9 +404,20 @@ class CCTmuxService:
             session = started["session_id"]
         if not session:
             raise CCTmuxError("metadata.project_path or metadata.session is required")
+        return str(session), content, started
+
+    def chat_completion(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = metadata or {}
+        session, content, _started = self._resolve_chat_target(messages, metadata)
 
         result = self.send_message(
-            str(session),
+            session,
             content=content,
             wait_ready=bool(metadata.get("wait_ready", True)),
             timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
@@ -291,6 +439,26 @@ class CCTmuxService:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "metadata": {"session": result.get("session"), "ready": result.get("ready")},
         }
+
+    def chat_completion_stream_events(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        metadata = metadata or {}
+        session, content, _started = self._resolve_chat_target(messages, metadata)
+        baseline = str(self.status(session, lines=120).get("capture") or "")
+        self.tmux.send_text(f"{session}:0.0", content)
+        yield from openai_stream_events(
+            model=model,
+            session_id=session,
+            status_func=lambda: self.status(session, lines=120),
+            baseline_capture=baseline,
+            interval=float(metadata.get("stream_interval", 0.5)),
+            timeout=float(metadata.get("timeout_seconds", 120.0)),
+        )
 
     def wait_for_new_turn_ready(
         self,
@@ -356,6 +524,120 @@ class CCTmuxService:
             time.sleep(0.25)
 
 
+def session_event_stream(
+    status_func: Callable[[], dict[str, Any]],
+    *,
+    interval: float = 1.0,
+    max_ticks: int | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Iterator[str]:
+    previous_capture = ""
+    tick = 0
+    while max_ticks is None or tick < max_ticks:
+        status = with_state(status_func())
+        capture = str(status.get("capture") or "")
+        status_subset = {
+            key: status.get(key)
+            for key in (
+                "session_id",
+                "name",
+                "session",
+                "exists",
+                "done",
+                "last_prompt_ready",
+                "plan_mode",
+                "awaiting_plan_approval",
+                "plan_file",
+                "state",
+            )
+            if key in status
+        }
+        yield sse_format("status", status_subset)
+        delta = _capture_delta(previous_capture, capture)
+        if delta:
+            yield sse_format("capture_delta", {"text": delta})
+        if bool(status.get("awaiting_plan_approval")):
+            decision = dict(PLAN_APPROVAL_DECISION)
+            decision["session_id"] = status.get("session_id")
+            if status.get("plan_file"):
+                decision["plan_file"] = status["plan_file"]
+            yield sse_format("decision_required", decision)
+        previous_capture = capture
+        tick += 1
+        if max_ticks is None or tick < max_ticks:
+            sleep(max(interval, 0.0))
+
+
+def openai_stream_events(
+    *,
+    model: str,
+    session_id: str,
+    status_func: Callable[[], dict[str, Any]],
+    baseline_capture: str = "",
+    interval: float = 0.5,
+    timeout: float = 120.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Iterator[dict[str, Any]]:
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    previous_capture = baseline_capture
+    capture_changed = False
+    saw_not_ready = False
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        status = with_state(status_func())
+        capture = str(status.get("capture") or "")
+        ready = bool(status.get("last_prompt_ready"))
+        if capture != baseline_capture:
+            capture_changed = True
+        if capture_changed and not ready:
+            saw_not_ready = True
+        delta = _capture_delta(previous_capture, capture)
+        if delta:
+            yield _openai_stream_chunk(
+                chunk_id=chunk_id,
+                created=created,
+                model=model,
+                content=delta,
+                finish_reason=None,
+            )
+        previous_capture = capture
+        if capture_changed and saw_not_ready and ready:
+            break
+        if time.monotonic() >= deadline:
+            break
+        sleep(min(max(interval, 0.0), max(0.0, deadline - time.monotonic())))
+    yield _openai_stream_chunk(
+        chunk_id=chunk_id,
+        created=created,
+        model=model,
+        content="",
+        finish_reason="stop",
+    )
+
+
+def _openai_stream_chunk(
+    *, chunk_id: str, created: int, model: str, content: str, finish_reason: str | None
+) -> dict[str, Any]:
+    choice: dict[str, Any] = {"index": 0, "delta": {}, "finish_reason": finish_reason}
+    if content:
+        choice["delta"] = {"content": content}
+    return {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+
+
+def _status_path(line: str) -> str:
+    path = line[3:] if len(line) > 3 else line.strip()
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    return path.strip()
+
+
 def _last_user_content(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") == "user":
@@ -382,8 +664,8 @@ def _assistant_content_from_capture(capture: str, *, max_chars: int = 6000) -> s
 
 def create_app(service: CCTmuxService | None = None):
     try:
-        from fastapi import FastAPI, HTTPException, Query
-        from fastapi.responses import JSONResponse
+        from fastapi import FastAPI, HTTPException, Query, Request
+        from fastapi.responses import JSONResponse, StreamingResponse
     except ImportError as exc:  # pragma: no cover - exercised by CLI when extras missing
         raise RuntimeError(
             "cc-tmux serve requires FastAPI and uvicorn. Install with: "
@@ -419,7 +701,28 @@ def create_app(service: CCTmuxService | None = None):
 
     @app.get("/v1/sessions/{session_id}/status")
     def session_status(session_id: str) -> dict[str, Any]:
-        return app.state.service.status(session_id)
+        return with_state(app.state.service.status(session_id))
+
+    @app.get("/v1/sessions/{session_id}/events")
+    async def session_events(
+        request: Request,
+        session_id: str,
+        interval: float = Query(default=1.0, ge=0.1, le=60.0),
+        n: int = Query(default=120, ge=1, le=5000),
+    ):
+        async def event_generator():
+            while not await request.is_disconnected():
+                for event in session_event_stream(
+                    lambda: app.state.service.status(session_id, lines=n),
+                    interval=interval,
+                    max_ticks=1,
+                ):
+                    yield event
+                import asyncio
+
+                await asyncio.sleep(interval)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @app.get("/v1/sessions/{session_id}/capture")
     def session_capture(
@@ -457,27 +760,55 @@ def create_app(service: CCTmuxService | None = None):
             raise HTTPException(status_code=422, detail="keys must be a list of strings")
         return app.state.service.send_keys(session_id, keys=keys)
 
+    @app.get("/v1/sessions/{session_id}/decisions")
+    def session_decisions(session_id: str) -> list[dict[str, Any]]:
+        return app.state.service.decisions(session_id)
+
+    @app.post("/v1/sessions/{session_id}/decisions")
+    def session_post_decision(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        decision_id = body.get("decision_id")
+        option = body.get("option")
+        if not isinstance(decision_id, str) or not decision_id:
+            raise HTTPException(status_code=422, detail="decision_id is required")
+        if not isinstance(option, str) or not option:
+            raise HTTPException(status_code=422, detail="option is required")
+        feedback = body.get("feedback")
+        if feedback is not None and not isinstance(feedback, str):
+            raise HTTPException(status_code=422, detail="feedback must be a string")
+        return app.state.service.post_decision(
+            session_id, decision_id=decision_id, option=option, feedback=feedback
+        )
+
+    @app.get("/v1/sessions/{session_id}/artifacts")
+    def session_artifacts(session_id: str) -> dict[str, Any]:
+        return app.state.service.artifacts(session_id)
+
     @app.delete("/v1/sessions/{session_id}")
     def delete_session(session_id: str) -> dict[str, Any]:
         return app.state.service.stop_session(session_id)
 
     @app.post("/v1/chat/completions")
-    def chat_completions(body: dict[str, Any]) -> dict[str, Any]:
-        if body.get("stream") is True:
-            raise HTTPException(
-                status_code=501,
-                detail="stream=true is not supported by the cc-tmux MVP server",
-            )
+    def chat_completions(body: dict[str, Any]):
         model = body.get("model")
         messages = body.get("messages")
         if not isinstance(model, str) or not model:
             raise HTTPException(status_code=422, detail="model is required")
         if not isinstance(messages, list):
             raise HTTPException(status_code=422, detail="messages must be a list")
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        if body.get("stream") is True:
+            def stream_generator():
+                for chunk in app.state.service.chat_completion_stream_events(
+                    model=model, messages=messages, metadata=metadata
+                ):
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
         return app.state.service.chat_completion(
             model=model,
             messages=messages,
-            metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+            metadata=metadata,
         )
 
     return app

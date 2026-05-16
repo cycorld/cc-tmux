@@ -8,7 +8,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-from cc_tmux.server import CCTmuxService, create_app
+from cc_tmux.server import CCTmuxService, create_app, openai_stream_events, session_event_stream
 
 
 class FakeService:
@@ -59,6 +59,41 @@ class FakeService:
             "name": session_id,
             "session": session_id,
             "capture": "tail",
+        }
+
+    def decisions(self, session_id):
+        self.calls.append(("decisions", session_id))
+        return []
+
+    def post_decision(self, session_id, *, decision_id, option, feedback=None):
+        self.calls.append(
+            (
+                "post_decision",
+                {
+                    "session_id": session_id,
+                    "decision_id": decision_id,
+                    "option": option,
+                    "feedback": feedback,
+                },
+            )
+        )
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "decision_id": decision_id,
+            "option": option,
+            "keys": [option, "Enter"],
+        }
+
+    def artifacts(self, session_id):
+        self.calls.append(("artifacts", session_id))
+        return {
+            "session_id": session_id,
+            "project_path": "/tmp/demo",
+            "git_status_short": " M README.md",
+            "changed_files": ["README.md"],
+            "diff_stat": "README.md | 1 +",
         }
 
     def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
@@ -135,6 +170,28 @@ class FakeService:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
+    def chat_completion_stream_events(self, *, model, messages, metadata=None):
+        self.calls.append(
+            (
+                "chat_completion_stream_events",
+                {"model": model, "messages": messages, "metadata": metadata},
+            )
+        )
+        yield {
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}],
+        }
+        yield {
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+
 
 def make_client():
     service = FakeService()
@@ -157,7 +214,9 @@ def test_session_rest_flow_uses_service():
         "session_id"
     ] == "cc-tmux-demo"
     assert client.get("/v1/sessions").json()[0]["session"] == "cc-tmux-demo"
-    assert client.get("/v1/sessions/cc-tmux-demo/status").json()["last_prompt_ready"] is True
+    status = client.get("/v1/sessions/cc-tmux-demo/status").json()
+    assert status["last_prompt_ready"] is True
+    assert status["state"] == "idle"
     assert client.get("/v1/sessions/cc-tmux-demo/capture?n=5&ansi=true").json()["capture"] == "tail"
     assert client.post(
         "/v1/sessions/cc-tmux-demo/messages",
@@ -265,13 +324,141 @@ def test_wait_for_new_turn_ready_times_out_without_busy_lifecycle(monkeypatch):
     assert len(service.seen) == 2
 
 
-def test_chat_completions_rejects_streaming():
-    client, _service = make_client()
+def test_chat_completions_streaming_sse_shape():
+    client, service = make_client()
 
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "cc-tmux", "messages": [], "stream": True},
+        json={
+            "model": "cc-tmux",
+            "messages": [{"role": "user", "content": "do work"}],
+            "metadata": {"session": "cc-tmux-demo"},
+            "stream": True,
+        },
     )
 
-    assert response.status_code == 501
-    assert "stream=true is not supported" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    text = response.text
+    assert "data: {" in text
+    assert '"object": "chat.completion.chunk"' in text
+    assert '"content": "hello"' in text
+    assert "data: [DONE]" in text
+    assert service.calls[-1][0] == "chat_completion_stream_events"
+
+
+def test_decisions_and_artifacts_routes_use_service():
+    client, service = make_client()
+
+    assert client.get("/v1/sessions/cc-tmux-demo/decisions").json() == []
+    posted = client.post(
+        "/v1/sessions/cc-tmux-demo/decisions",
+        json={"decision_id": "plan_approval", "option": "2"},
+    ).json()
+    assert posted["keys"] == ["2", "Enter"]
+    artifacts = client.get("/v1/sessions/cc-tmux-demo/artifacts").json()
+    assert artifacts["changed_files"] == ["README.md"]
+    assert ("artifacts", "cc-tmux-demo") in service.calls
+
+
+def test_session_event_stream_formats_status_delta_and_decision():
+    statuses = iter(
+        [
+            {
+                "session_id": "cc-tmux-demo",
+                "exists": True,
+                "last_prompt_ready": False,
+                "plan_mode": False,
+                "awaiting_plan_approval": False,
+                "capture": "hello",
+            },
+            {
+                "session_id": "cc-tmux-demo",
+                "exists": True,
+                "last_prompt_ready": False,
+                "plan_mode": False,
+                "awaiting_plan_approval": True,
+                "capture": "hello world",
+            },
+        ]
+    )
+
+    events = list(session_event_stream(lambda: next(statuses), interval=0, max_ticks=2))
+
+    assert events[0].startswith("event: status\ndata: ")
+    assert '"state": "running"' in events[0]
+    assert events[1] == 'event: capture_delta\ndata: {"text": "hello"}\n\n'
+    assert 'event: decision_required\n' in events[-1]
+    assert '"recommended_option": "2"' in events[-1]
+
+
+def test_openai_stream_events_yields_deltas_stop_chunk():
+    statuses = iter(
+        [
+            {"exists": True, "last_prompt_ready": True, "capture": "old"},
+            {"exists": True, "last_prompt_ready": False, "capture": "old new"},
+            {"exists": True, "last_prompt_ready": True, "capture": "old new done"},
+        ]
+    )
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=lambda: next(statuses),
+            baseline_capture="old",
+            interval=0,
+            timeout=5,
+            sleep=lambda _seconds: None,
+        )
+    )
+
+    assert chunks[0]["object"] == "chat.completion.chunk"
+    assert chunks[0]["choices"][0]["delta"]["content"] == " new"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_service_decisions_use_plan_approval_status():
+    service = FakeWaitService(
+        [
+            {
+                "session_id": "cc-tmux-demo",
+                "exists": True,
+                "last_prompt_ready": False,
+                "plan_mode": True,
+                "awaiting_plan_approval": True,
+                "plan_file": "/tmp/plan.md",
+                "capture": "plan",
+            }
+        ]
+    )
+
+    decisions = service.decisions("cc-tmux-demo")
+
+    assert decisions[0]["id"] == "plan_approval"
+    assert decisions[0]["recommended_option"] == "2"
+    assert decisions[0]["plan_file"] == "/tmp/plan.md"
+
+
+def test_service_artifacts_git_and_non_git(tmp_path):
+    service = CCTmuxService.__new__(CCTmuxService)
+
+    non_git = tmp_path / "non-git"
+    non_git.mkdir()
+    non_git_payload = service.artifacts(project_path=str(non_git))
+    assert non_git_payload["changed_files"] == []
+    assert non_git_payload["error"] == "not a git repository"
+
+    git_repo = tmp_path / "repo"
+    git_repo.mkdir()
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=git_repo, check=True, capture_output=True)
+    readme = git_repo / "README.md"
+    readme.write_text("hello\n")
+
+    payload = service.artifacts(project_path=str(git_repo))
+
+    assert "error" not in payload
+    assert "README.md" in payload["changed_files"]
+    assert "README.md" in payload["git_status_short"]

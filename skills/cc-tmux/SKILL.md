@@ -96,13 +96,16 @@ Endpoints mirror the CLI:
 
 - `GET /health`: readiness check.
 - `POST /v1/sessions`: start/reuse a Claude Code tmux worker with `project_path`, optional `name`, `prompt`, `permission_mode`, and `auto_trust`.
-- `GET /v1/sessions`, `GET /v1/sessions/{id}/status`, `GET /v1/sessions/{id}/capture?n=120`: inspect state and transcript tail.
+- `GET /v1/sessions`, `GET /v1/sessions/{id}/status`, `GET /v1/sessions/{id}/capture?n=120`: inspect state and transcript tail. Status includes derived `state`: `stopped`, `awaiting_plan_approval`, `plan_mode`, `idle`, or `running`.
+- `GET /v1/sessions/{id}/events?interval=1.0&n=120`: SSE stream with `status`, `capture_delta`, and `decision_required` events.
 - `POST /v1/sessions/{id}/messages`: send a prompt, optionally `wait_ready` until the prompt returns.
 - `POST /v1/sessions/{id}/interrupt` and `/key`: recover or operate focused TUI controls.
+- `GET/POST /v1/sessions/{id}/decisions`: list and answer pending plan-approval decisions. Default recommendation is option `2` (manual approve edits); posting sends the raw option key plus `Enter`.
+- `GET /v1/sessions/{id}/artifacts`: return git `status --short`, changed files, and `diff --stat` for the recorded project path.
 - `DELETE /v1/sessions/{id}`: ask Claude to exit and kill the tmux session if it remains live.
-- `POST /v1/chat/completions`: minimal OpenAI-compatible non-streaming wrapper. Put `project_path`, `session`, `permission_mode`, `wait_ready`, or `timeout_seconds` in `metadata`.
+- `POST /v1/chat/completions`: minimal OpenAI-compatible wrapper. `stream=true` returns SSE chat completion chunks from capture deltas followed by `[DONE]`. Put `project_path`, `session`, `permission_mode`, `wait_ready`, `timeout_seconds`, or `stream_interval` in `metadata`.
 
-Server caveats: no built-in authentication, no streaming yet (`stream=true` returns `501`), synchronous request handling, and OpenAI-style assistant content is a cleaned transcript tail. `wait_ready` waits for a new captured turn lifecycle (screen change, non-ready/busy state, then ready prompt again), but remains a tmux/TUI heuristic rather than a formal Claude Code completion signal. Keep it bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
+Server caveats: no built-in authentication, OpenAI-style assistant content is a cleaned transcript tail/capture delta, and readiness is a tmux/TUI heuristic rather than a formal Claude Code completion signal. Decision option `4` with feedback is best-effort because the focused Claude TUI can change. Keep the server bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
 
 ## Plan mode operator guidance
 
