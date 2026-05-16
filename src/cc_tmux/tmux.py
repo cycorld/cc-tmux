@@ -20,6 +20,7 @@ _DONE_MARKERS = (
 )
 _CLAUDE_PROMPT_RE = re.compile(r"^\s*(?:[│┃┆┊╎╏]\s*)?(?:❯|>|›)\s*(?:$|\S)")
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_PLAN_FILE_RE = re.compile(r"~/.claude/plans/[A-Za-z0-9_.-]+\.md")
 
 
 class CCTmuxError(RuntimeError):
@@ -170,6 +171,52 @@ def prompt_ready_heuristic(capture: str) -> bool:
         if _CLAUDE_PROMPT_RE.search(stripped):
             return True
     return False
+
+
+def plan_mode_heuristic(capture: str) -> bool:
+    """Return True when capture suggests Claude Code is in plan mode.
+
+    Claude Code exposes plan mode only through terminal text/status today. Match the
+    status-bar form observed from ``--permission-mode plan`` plus the slash-command
+    transition and approval screen text observed from ``/plan``.
+    """
+    if not capture.strip():
+        return False
+    text = _strip_ansi(capture)
+    return any(
+        marker in text
+        for marker in (
+            "plan mode on",
+            "Enabled plan mode",
+            "Ready to code?",
+            "Here is Claude's plan:",
+            "Claude has written up a plan and is ready to execute.",
+        )
+    )
+
+
+def awaiting_plan_approval_heuristic(capture: str) -> bool:
+    """Return True when Claude Code appears to be waiting on plan approval."""
+    if not capture.strip():
+        return False
+    text = _strip_ansi(capture)
+    has_ready_prompt = "Ready to code?" in text
+    has_approval_question = "Would you like to proceed?" in text
+    has_approval_options = all(
+        option in text
+        for option in (
+            "Yes, auto-accept edits",
+            "Yes, manually approve edits",
+            "Tell Claude what to change",
+        )
+    )
+    return has_ready_prompt and (has_approval_question or has_approval_options)
+
+
+def plan_file_heuristic(capture: str) -> str | None:
+    """Return the first visible Claude Code plan file path, if present."""
+    match = _PLAN_FILE_RE.search(_strip_ansi(capture))
+    return match.group(0) if match else None
 
 
 def known_records() -> list[SessionRecord]:

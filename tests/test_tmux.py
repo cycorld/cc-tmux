@@ -5,8 +5,11 @@ import pytest
 from cc_tmux.tmux import (
     CCTmuxError,
     Tmux,
+    awaiting_plan_approval_heuristic,
     claude_command,
     normalize_session_name,
+    plan_file_heuristic,
+    plan_mode_heuristic,
     prompt_done_heuristic,
     prompt_ready_heuristic,
     resolve_session,
@@ -119,3 +122,34 @@ def test_prompt_ready_heuristic_ignores_old_history_outside_tail():
 def test_prompt_ready_heuristic_strips_ansi_and_detects_ascii_prompt():
     assert prompt_ready_heuristic("working\n\x1b[36m│ > \x1b[0m")
     assert not prompt_ready_heuristic("")
+
+
+def test_plan_mode_heuristic_detects_status_bar_and_slash_command_entry():
+    assert plan_mode_heuristic("⏸ plan mode on (shift+tab to cycle)")
+    assert plan_mode_heuristic("⎿ Enabled plan mode\nReady to code?")
+    assert not plan_mode_heuristic("work complete\n│ ❯ ")
+
+
+def test_plan_approval_heuristic_detects_ready_to_code_screen():
+    capture = "\n".join(
+        [
+            "Ready to code?",
+            "Here is Claude's plan:",
+            "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+            "1. Yes, auto-accept edits",
+            "2. Yes, manually approve edits",
+            "3. No, refine with Ultraplan on Claude Code on the web",
+            "4. Tell Claude what to change",
+        ]
+    )
+
+    assert plan_mode_heuristic(capture)
+    assert awaiting_plan_approval_heuristic(capture)
+    assert not awaiting_plan_approval_heuristic("Ready to code?\nDrafting plan...")
+
+
+def test_plan_file_heuristic_extracts_visible_plan_path_and_strips_ansi():
+    capture = "Saved to \x1b[36m~/.claude/plans/fluffy-wibbling-oasis.md\x1b[0m"
+
+    assert plan_file_heuristic(capture) == "~/.claude/plans/fluffy-wibbling-oasis.md"
+    assert plan_file_heuristic("no plan file") is None

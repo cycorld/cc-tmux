@@ -63,7 +63,7 @@ Hermes agents can call the CLI from shell tools. Recommended pattern:
 
 1. Start a named session per repository or user task.
 2. Store the session name in the parent task state.
-3. Poll `cc-tmux status --json` for `exists`; use `last_prompt_ready` (or legacy `done`) as the prompt-ready heuristic.
+3. Poll `cc-tmux status --json` for `exists`; use `last_prompt_ready` (or legacy `done`) as the prompt-ready heuristic. For planning flows, also watch `plan_mode`, `awaiting_plan_approval`, and `plan_file`.
 4. Use `cc-tmux capture -n 80` for summaries sent back to Telegram.
 
 Example:
@@ -83,6 +83,35 @@ Pitfalls:
 - Close Claude Code overlays and side panels with `cc-tmux key hermes-app Escape`.
 - Capture output is for status, not a formal API contract.
 
+## Plan mode operator guidance
+
+Use plan mode when the supervisor wants Claude to propose steps without changing files yet. Live testing confirmed `/plan ...` and `--permission-mode plan` show a plan/approval flow and do not create the requested file before approval.
+
+Start directly in plan mode:
+
+```bash
+cc-tmux start . --name planner --permission-mode plan --prompt "Plan adding FEATURE.md, do not implement"
+```
+
+Or ask an existing worker for a plan:
+
+```bash
+cc-tmux send planner "/plan Create a step-by-step plan for the requested change, but do not implement."
+cc-tmux status planner --json
+```
+
+Operational signals:
+
+- `plan_mode`: true when capture shows `plan mode on`, `Enabled plan mode`, or the plan approval screen.
+- `awaiting_plan_approval`: true when Claude is at `Ready to code?` / `Would you like to proceed?`.
+- `plan_file`: a visible `~/.claude/plans/<name>.md` path, or null.
+
+Approval caution:
+
+- Inspect `cc-tmux capture planner -n 120` before sending keys.
+- If option `1. Yes, auto-accept edits` is selected and you intend to implement, `cc-tmux key planner Enter` approves it.
+- To revise the plan, choose option `4` or send feedback carefully; blind free-form sends may be interpreted by the focused approval UI rather than as a normal prompt.
+
 ## Claude Code slash commands and overlays
 
 Claude Code slash commands can be driven through `cc-tmux send`:
@@ -96,6 +125,7 @@ Operator guidance:
 - Use `/btw <question>` for a side question while preserving the main task context. Live testing showed `/btw What is 2+2? answer in one short sentence.` produced `2+2 equals 4.`
 - `/btw` and other slash commands may open overlays with controls such as `Esc to close`; close them with `cc-tmux key SESSION Escape` before continuing automated sends.
 - `/loop` loads/starts the looping skill and can lead to durable or autonomous repeated actions. Use it only intentionally, with explicit prompt and interval instructions, and close test overlays with `cc-tmux key SESSION Escape`.
+- `/plan <request>` enters plan mode and can stop at the approval UI. Use the plan-mode status fields before approving or revising.
 - `/help` is useful for discovering the currently available command surface.
 
 ## Claude Code as the controlled worker

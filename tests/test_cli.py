@@ -95,6 +95,9 @@ def test_status_missing_session_json_exits_success(monkeypatch, capsys):
     assert payload["exists"] is False
     assert payload["done"] is False
     assert payload["last_prompt_ready"] is False
+    assert payload["plan_mode"] is False
+    assert payload["awaiting_plan_approval"] is False
+    assert payload["plan_file"] is None
 
 
 def test_key_command_sends_tmux_keys_without_shell(monkeypatch, capsys):

@@ -59,8 +59,13 @@ cc-tmux send ~/projects/my-app "Implement the smallest safe fix and run tests."
 cc-tmux interrupt ~/projects/my-app --wait-ready 10
 cc-tmux send ~/projects/my-app "Revise the plan: only inspect files for now."
 
-# See recent pane output and the prompt-done heuristic.
+# See recent pane output plus prompt/plan-mode heuristics.
 cc-tmux status ~/projects/my-app
+
+# Ask Claude Code for a plan without implementing it.
+cc-tmux start . --name planner --permission-mode plan --prompt "Plan X, do not implement"
+cc-tmux send planner "/plan Create a step-by-step plan for X, but do not implement."
+cc-tmux status planner --json
 
 # Capture more transcript lines.
 cc-tmux capture ~/projects/my-app -n 120
@@ -136,11 +141,33 @@ cc-tmux send api-fix "New instruction after interruption."
 
 ### `cc-tmux status <session_or_project> [--json]`
 
-Reports whether the tmux session exists, whether the pane appears ready for a prompt, and the latest capture snippet. JSON output includes both `done` (kept for compatibility) and `last_prompt_ready` for the prompt-ready heuristic.
+Reports whether the tmux session exists, whether the pane appears ready for a prompt, plan-mode state, and the latest capture snippet. JSON output includes both `done` (kept for compatibility) and `last_prompt_ready` for the prompt-ready heuristic, plus:
+
+- `plan_mode`: true when the capture looks like Claude Code plan mode (`plan mode on`, `Enabled plan mode`, or the plan approval screen).
+- `awaiting_plan_approval`: true when Claude is showing the `Ready to code?` / `Would you like to proceed?` approval prompt.
+- `plan_file`: a visible `~/.claude/plans/<name>.md` path, or null.
 
 ```bash
 cc-tmux status . --json
 ```
+
+### Plan mode workflow
+
+Use Claude Code plan mode when you want an implementation plan without edits yet. Live testing confirmed both `--permission-mode plan` and `/plan ...` leave the filesystem unchanged until approval.
+
+```bash
+cc-tmux start . --name planner --permission-mode plan --prompt "Plan X, do not implement"
+cc-tmux send planner "/plan Create a step-by-step plan for X, but do not implement."
+cc-tmux status planner --json
+```
+
+When the approval screen is visible, `status --json` should report `plan_mode: true`, `awaiting_plan_approval: true`, and may expose `plan_file` such as `~/.claude/plans/fluffy-wibbling-oasis.md`. The screen's default option is typically `1. Yes, auto-accept edits`; if that is selected and you intentionally want to proceed, approve with:
+
+```bash
+cc-tmux key planner Enter
+```
+
+To request plan changes, select option `4` or send feedback carefully. Avoid sending free-form follow-up text blindly while the approval UI is focused; inspect `cc-tmux capture planner -n 120` first so you know which option is selected and whether your text will be interpreted as approval feedback.
 
 ### `cc-tmux capture <session_or_project>`
 
@@ -203,6 +230,7 @@ Live testing confirmed these Claude Code slash commands work inside a `cc-tmux`-
 - `/help`: displays Claude Code's command surface and currently includes `/btw`.
 - `/btw <question>`: asks a side question without derailing the main task. Example: `/btw What is 2+2? answer in one short sentence.` returned `2+2 equals 4.` The side-question overlay shows controls such as `Esc to close`; close it with `cc-tmux key SESSION Escape` before continuing automation.
 - `/loop`: loads the loop skill and asks for prompt/interval details. It may start durable or autonomous repeated actions, so use it only intentionally. When testing or dismissing overlays, send `cc-tmux key SESSION Escape`.
+- `/plan <request>`: enables plan mode and asks Claude for a plan before implementation. Inspect with `cc-tmux status SESSION --json`; approve only intentionally with `cc-tmux key SESSION Enter` when the desired option is selected, or choose `4`/feedback to revise.
 
 Slash command prompts are still just text sent to Claude Code, for example:
 

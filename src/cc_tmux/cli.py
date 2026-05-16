@@ -13,9 +13,12 @@ from .state import SessionRecord, remove_record, upsert_record
 from .tmux import (
     CCTmuxError,
     Tmux,
+    awaiting_plan_approval_heuristic,
     claude_command,
     known_records,
     normalize_session_name,
+    plan_file_heuristic,
+    plan_mode_heuristic,
     prompt_done_heuristic,
     prompt_ready_heuristic,
     resolve_session,
@@ -126,18 +129,27 @@ def _status_payload(identifier: str) -> dict[str, object]:
             "exists": False,
             "done": False,
             "last_prompt_ready": False,
+            "plan_mode": False,
+            "awaiting_plan_approval": False,
+            "plan_file": None,
             "capture": "",
         }
     exists = tmux.has_session(session)
     capture = tmux.capture(f"{session}:0.0", lines=80) if exists else ""
     done = prompt_done_heuristic(capture)
     ready = prompt_ready_heuristic(capture)
+    plan_mode = plan_mode_heuristic(capture)
+    awaiting_plan_approval = awaiting_plan_approval_heuristic(capture)
+    plan_file = plan_file_heuristic(capture)
     return {
         "identifier": identifier,
         "session": session,
         "exists": exists,
         "done": done,
         "last_prompt_ready": ready,
+        "plan_mode": plan_mode,
+        "awaiting_plan_approval": awaiting_plan_approval,
+        "plan_file": plan_file,
         "capture": capture,
     }
 
@@ -150,6 +162,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"session: {payload['session']}")
         print(f"exists: {payload['exists']}")
         print(f"prompt_done: {payload['done']}")
+        print(f"last_prompt_ready: {payload['last_prompt_ready']}")
+        print(f"plan_mode: {payload['plan_mode']}")
+        print(f"awaiting_plan_approval: {payload['awaiting_plan_approval']}")
+        print(f"plan_file: {payload['plan_file']}")
         capture = str(payload.get("capture") or "").rstrip()
         if capture:
             print("--- capture ---")
