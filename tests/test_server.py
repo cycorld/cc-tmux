@@ -38,8 +38,8 @@ class FakeService:
         self.calls.append(("list_sessions", None))
         return self.sessions
 
-    def status(self, session_id):
-        self.calls.append(("status", session_id))
+    def status(self, session_id, *, lines=80):
+        self.calls.append(("status", {"session_id": session_id, "lines": lines}))
         return {
             "session_id": session_id,
             "name": session_id,
@@ -347,6 +347,23 @@ def test_chat_completions_streaming_sse_shape():
     assert service.calls[-1][0] == "chat_completion_stream_events"
 
 
+def test_session_events_accepts_float_interval():
+    app = create_app(FakeService())
+    route = next(route for route in app.routes if route.path == "/v1/sessions/{session_id}/events")
+    query_params = {field.name: field for field in route.dependant.query_params}
+
+    assert "request" not in query_params
+    interval, interval_errors = query_params["interval"].validate(
+        "0.2", {}, loc=("query", "interval")
+    )
+    lines, lines_errors = query_params["n"].validate("40", {}, loc=("query", "n"))
+
+    assert not interval_errors
+    assert interval == 0.2
+    assert not lines_errors
+    assert lines == 40
+
+
 def test_decisions_and_artifacts_routes_use_service():
     client, service = make_client()
 
@@ -462,3 +479,26 @@ def test_service_artifacts_git_and_non_git(tmp_path):
     assert "error" not in payload
     assert "README.md" in payload["changed_files"]
     assert "README.md" in payload["git_status_short"]
+
+
+def test_service_artifacts_resolves_short_session_and_untracked_files(tmp_path, monkeypatch):
+    git_repo = tmp_path / "repo"
+    git_repo.mkdir()
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=git_repo, check=True, capture_output=True)
+    (git_repo / "REST_V02_OK.md").write_text("created live\n")
+
+    from cc_tmux.state import SessionRecord
+
+    monkeypatch.setattr(
+        "cc_tmux.server.known_records",
+        lambda: [SessionRecord.create(git_repo, "cc-tmux-serve-v02")],
+    )
+
+    service = CCTmuxService.__new__(CCTmuxService)
+    payload = service.artifacts("serve-v02")
+
+    assert payload["project_path"] == str(git_repo.resolve())
+    assert payload["changed_files"] == ["REST_V02_OK.md"]
+    assert "?? REST_V02_OK.md" in payload["git_status_short"]

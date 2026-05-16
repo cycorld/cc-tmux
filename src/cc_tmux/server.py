@@ -1,13 +1,12 @@
-from __future__ import annotations
-
 import json
 import shutil
 import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from .state import SessionRecord, remove_record, upsert_record
 from .tmux import (
@@ -310,8 +309,11 @@ class CCTmuxService:
         self, session_id: str | None = None, *, project_path: str | None = None
     ) -> dict[str, Any]:
         if project_path is None and session_id is not None:
+            session_candidates = {session_id}
+            with suppress(CCTmuxError):
+                session_candidates.add(normalize_session_name(session_id))
             for record in known_records():
-                if record.session_name == session_id:
+                if record.session_name in session_candidates:
                     project_path = record.project_path
                     break
         payload: dict[str, Any] = {
@@ -707,8 +709,8 @@ def create_app(service: CCTmuxService | None = None):
     async def session_events(
         request: Request,
         session_id: str,
-        interval: float = Query(default=1.0, ge=0.1, le=60.0),
-        n: int = Query(default=120, ge=1, le=5000),
+        interval: Annotated[float, Query(ge=0.1, le=30.0)] = 1.0,
+        n: Annotated[int, Query(ge=1, le=5000)] = 120,
     ):
         async def event_generator():
             while not await request.is_disconnected():
@@ -727,7 +729,7 @@ def create_app(service: CCTmuxService | None = None):
     @app.get("/v1/sessions/{session_id}/capture")
     def session_capture(
         session_id: str,
-        n: int = Query(default=120, ge=1, le=5000),
+        n: Annotated[int, Query(ge=1, le=5000)] = 120,
         ansi: bool = False,
     ) -> dict[str, Any]:
         return app.state.service.capture(session_id, lines=n, ansi=ansi)
