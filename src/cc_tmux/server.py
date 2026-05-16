@@ -8,6 +8,12 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Any
 
+from .claude_logs import (
+    extract_final_assistant_text,
+    latest_log_file,
+    parse_log_objects,
+    read_jsonl_events,
+)
 from .state import SessionRecord, remove_record, upsert_record
 from .tmux import (
     CCTmuxError,
@@ -210,6 +216,38 @@ class CCTmuxService:
             "capture": self.tmux.capture(f"{session}:0.0", lines=lines, ansi=ansi),
         }
 
+    def _project_path_for_session(self, session_id: str) -> Path | None:
+        session_candidates = {session_id}
+        tmux = getattr(self, "tmux", None)
+        if tmux is not None:
+            with suppress(CCTmuxError):
+                session_candidates.add(resolve_session(session_id, tmux))
+        with suppress(CCTmuxError):
+            session_candidates.add(normalize_session_name(session_id))
+        for record in known_records():
+            if record.session_name in session_candidates or session_id == record.project_path:
+                return Path(record.project_path).expanduser().resolve()
+        return None
+
+    def log_events(self, session_id: str, offset: int = 0) -> dict[str, Any]:
+        project = self._project_path_for_session(session_id)
+        if project is None:
+            return {"session_id": session_id, "events": [], "offset": offset, "log_path": None}
+        log_path = latest_log_file(project)
+        if log_path is None:
+            return {"session_id": session_id, "events": [], "offset": offset, "log_path": None}
+        events, new_offset = read_jsonl_events(log_path, offset=offset)
+        return {
+            "session_id": session_id,
+            "events": events,
+            "offset": new_offset,
+            "log_path": str(log_path),
+        }
+
+    def structured_events(self, session_id: str, offset: int = 0) -> dict[str, Any]:
+        payload = self.log_events(session_id, offset=offset)
+        return {**payload, "events": parse_log_objects(payload["events"])}
+
     def send_message(
         self,
         session_id: str,
@@ -274,6 +312,14 @@ class CCTmuxService:
             return []
         decision = dict(PLAN_APPROVAL_DECISION)
         decision["session_id"] = status.get("session_id", session_id)
+        structured = self.structured_events(session_id)
+        plans = [event for event in structured["events"] if event.get("type") == "plan"]
+        if plans:
+            plan = plans[-1]
+            if plan.get("plan_file"):
+                decision["plan_file"] = plan["plan_file"]
+            if plan.get("plan"):
+                decision["plan"] = plan["plan"]
         if status.get("plan_file"):
             decision["plan_file"] = status["plan_file"]
         return [decision]
@@ -358,6 +404,11 @@ class CCTmuxService:
         payload["changed_files"] = [
             _status_path(line) for line in status.splitlines() if line.strip()
         ]
+        if session_id is not None:
+            structured = self.structured_events(session_id)
+            touched = _tool_touched_files(structured["events"])
+            payload["tool_touched_files"] = touched
+            payload["changed_files"] = sorted(set(payload["changed_files"]) | set(touched))
         payload["diff_stat"] = diff_stat
         return payload
 
@@ -430,7 +481,10 @@ class CCTmuxService:
             wait_ready=bool(metadata.get("wait_ready", True)),
             timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
         )
-        answer = _assistant_content_from_capture(str(result.get("capture") or ""))
+        structured = self.structured_events(session)
+        answer = extract_final_assistant_text(structured["events"])
+        if not answer:
+            answer = _assistant_content_from_capture(str(result.get("capture") or ""))
         now = int(time.time())
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -445,7 +499,11 @@ class CCTmuxService:
                 }
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "metadata": {"session": result.get("session"), "ready": result.get("ready")},
+            "metadata": {
+                "session": result.get("session"),
+                "ready": result.get("ready"),
+                "log_path": structured.get("log_path"),
+            },
         }
 
     def chat_completion_stream_events(
@@ -458,11 +516,15 @@ class CCTmuxService:
         metadata = metadata or {}
         session, content, _started = self._resolve_chat_target(messages, metadata)
         baseline = str(self.status(session, lines=120).get("capture") or "")
+        structured = self.structured_events(session)
+        log_offset = int(structured.get("offset") or 0)
         self.tmux.send_text(f"{session}:0.0", content)
         yield from openai_stream_events(
             model=model,
             session_id=session,
             status_func=lambda: self.status(session, lines=120),
+            structured_events_func=lambda offset: self.structured_events(session, offset=offset),
+            baseline_log_offset=log_offset,
             baseline_capture=baseline,
             interval=float(metadata.get("stream_interval", 0.5)),
             timeout=float(metadata.get("timeout_seconds", 120.0)),
@@ -535,11 +597,15 @@ class CCTmuxService:
 def session_event_stream(
     status_func: Callable[[], dict[str, Any]],
     *,
+    structured_events_func: Callable[[int], dict[str, Any]] | None = None,
+    source: str = "auto",
+    initial_log_offset: int = 0,
     interval: float = 1.0,
     max_ticks: int | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Iterator[str]:
     previous_capture = ""
+    log_offset = initial_log_offset
     tick = 0
     while max_ticks is None or tick < max_ticks:
         status = with_state(status_func())
@@ -561,9 +627,17 @@ def session_event_stream(
             if key in status
         }
         yield sse_format("status", status_subset)
-        delta = _capture_delta(previous_capture, capture)
-        if delta:
-            yield sse_format("capture_delta", {"text": delta})
+        log_event_count = 0
+        if structured_events_func is not None and source in {"auto", "logs"}:
+            structured = structured_events_func(log_offset)
+            log_offset = int(structured.get("offset") or log_offset)
+            for event in structured.get("events", []):
+                log_event_count += 1
+                yield sse_format(str(event.get("type") or "log_event"), event)
+        if source != "logs":
+            delta = _capture_delta(previous_capture, capture)
+            if delta and (source == "capture" or log_event_count == 0):
+                yield sse_format("capture_delta", {"text": delta})
         if bool(status.get("awaiting_plan_approval")):
             decision = dict(PLAN_APPROVAL_DECISION)
             decision["session_id"] = status.get("session_id")
@@ -581,6 +655,8 @@ def openai_stream_events(
     model: str,
     session_id: str,
     status_func: Callable[[], dict[str, Any]],
+    structured_events_func: Callable[[int], dict[str, Any]] | None = None,
+    baseline_log_offset: int = 0,
     baseline_capture: str = "",
     interval: float = 0.5,
     timeout: float = 120.0,
@@ -589,8 +665,10 @@ def openai_stream_events(
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     previous_capture = baseline_capture
+    log_offset = baseline_log_offset
     capture_changed = False
     saw_not_ready = False
+    saw_log_text = False
     deadline = time.monotonic() + max(timeout, 0.0)
     while True:
         status = with_state(status_func())
@@ -600,8 +678,21 @@ def openai_stream_events(
             capture_changed = True
         if capture_changed and not ready:
             saw_not_ready = True
+        if structured_events_func is not None:
+            structured = structured_events_func(log_offset)
+            log_offset = int(structured.get("offset") or log_offset)
+            for event in structured.get("events", []):
+                if event.get("type") == "assistant_text" and event.get("text"):
+                    saw_log_text = True
+                    yield _openai_stream_chunk(
+                        chunk_id=chunk_id,
+                        created=created,
+                        model=model,
+                        content=str(event["text"]),
+                        finish_reason=None,
+                    )
         delta = _capture_delta(previous_capture, capture)
-        if delta:
+        if delta and not saw_log_text:
             yield _openai_stream_chunk(
                 chunk_id=chunk_id,
                 created=created,
@@ -644,6 +735,24 @@ def _status_path(line: str) -> str:
     if " -> " in path:
         path = path.split(" -> ", 1)[1]
     return path.strip()
+
+
+def _tool_touched_files(events: list[dict[str, Any]]) -> list[str]:
+    touched: set[str] = set()
+    for event in events:
+        if event.get("type") != "tool_use" or event.get("name") not in {
+            "Write",
+            "Edit",
+            "MultiEdit",
+        }:
+            continue
+        input_value = event.get("input")
+        if not isinstance(input_value, dict):
+            continue
+        path = input_value.get("file_path") or input_value.get("path")
+        if isinstance(path, str) and path:
+            touched.add(path)
+    return sorted(touched)
 
 
 def _last_user_content(messages: list[dict[str, Any]]) -> str:
@@ -717,11 +826,24 @@ def create_app(service: CCTmuxService | None = None):
         session_id: str,
         interval: Annotated[float, Query(ge=0.1, le=30.0)] = 1.0,
         n: Annotated[int, Query(ge=1, le=5000)] = 120,
+        source: Annotated[str, Query(pattern="^(auto|logs|capture)$")] = "auto",
     ):
         async def event_generator():
+            log_offset = 0
             while not await request.is_disconnected():
+                def structured(offset: int):
+                    nonlocal log_offset
+                    payload = app.state.service.structured_events(session_id, offset=offset)
+                    log_offset = int(payload.get("offset") or log_offset)
+                    return payload
+
                 for event in session_event_stream(
                     lambda: app.state.service.status(session_id, lines=n),
+                    structured_events_func=(
+                        structured if hasattr(app.state.service, "structured_events") else None
+                    ),
+                    source=source,
+                    initial_log_offset=log_offset,
                     interval=interval,
                     max_ticks=1,
                 ):

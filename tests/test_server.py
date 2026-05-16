@@ -139,6 +139,10 @@ class FakeService:
         self.calls.append(("send_keys", {"session_id": session_id, "keys": keys}))
         return {"session_id": session_id, "name": session_id, "session": session_id, "keys": keys}
 
+    def structured_events(self, session_id, offset=0):
+        self.calls.append(("structured_events", {"session_id": session_id, "offset": offset}))
+        return {"session_id": session_id, "events": [], "offset": offset, "log_path": None}
+
     def stop_session(self, session_id):
         self.calls.append(("stop_session", session_id))
         return {
@@ -379,6 +383,44 @@ def test_wait_for_new_turn_ready_times_out_without_busy_lifecycle(monkeypatch):
     assert len(service.seen) == 2
 
 
+class FakeLogCompletionService(CCTmuxService):
+    def __init__(self) -> None:
+        self.tmux = type("T", (), {"send_text": lambda _self, _target, _content: None})()
+
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "do work", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "raw capture should not win",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        return {
+            "session_id": session_id,
+            "offset": offset,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [{"type": "assistant_text", "text": "answer from logs"}],
+        }
+
+
+def test_service_chat_completion_uses_log_final_text():
+    service = FakeLogCompletionService()
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "do work"}],
+        metadata={"session": "cc-tmux-demo"},
+    )
+
+    assert payload["choices"][0]["message"]["content"] == "answer from logs"
+    assert payload["metadata"]["log_path"] == "/tmp/fake.jsonl"
+
+
 def test_chat_completions_streaming_sse_shape():
     client, service = make_client()
 
@@ -412,11 +454,14 @@ def test_session_events_accepts_float_interval():
         "0.2", {}, loc=("query", "interval")
     )
     lines, lines_errors = query_params["n"].validate("40", {}, loc=("query", "n"))
+    source, source_errors = query_params["source"].validate("logs", {}, loc=("query", "source"))
 
     assert not interval_errors
     assert interval == 0.2
     assert not lines_errors
     assert lines == 40
+    assert not source_errors
+    assert source == "logs"
 
 
 def test_decisions_and_artifacts_routes_use_service():
@@ -431,6 +476,73 @@ def test_decisions_and_artifacts_routes_use_service():
     artifacts = client.get("/v1/sessions/cc-tmux-demo/artifacts").json()
     assert artifacts["changed_files"] == ["README.md"]
     assert ("artifacts", "cc-tmux-demo") in service.calls
+
+
+def test_session_event_stream_emits_log_events_before_capture_fallback():
+    statuses = iter(
+        [
+            {
+                "session_id": "cc-tmux-demo",
+                "exists": True,
+                "last_prompt_ready": False,
+                "plan_mode": False,
+                "awaiting_plan_approval": False,
+                "capture": "screen text",
+            }
+        ]
+    )
+
+    events = list(
+        session_event_stream(
+            lambda: next(statuses),
+            structured_events_func=lambda offset: {
+                "offset": offset + 10,
+                "events": [{"type": "assistant_text", "text": "log text"}],
+            },
+            interval=0,
+            max_ticks=1,
+        )
+    )
+
+    assert 'event: assistant_text\n' in events[1]
+    assert '"text": "log text"' in events[1]
+    assert not any("capture_delta" in event for event in events)
+
+
+def test_openai_stream_events_prefers_log_text_over_capture():
+    statuses = iter(
+        [
+            {"exists": True, "last_prompt_ready": False, "capture": "old running"},
+            {"exists": True, "last_prompt_ready": True, "capture": "old running done"},
+        ]
+    )
+    calls = 0
+
+    def structured(offset):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "offset": offset + 1,
+                "events": [{"type": "assistant_text", "text": "from logs"}],
+            }
+        return {"offset": offset, "events": []}
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=lambda: next(statuses),
+            structured_events_func=structured,
+            baseline_capture="old",
+            interval=0,
+            timeout=5,
+            sleep=lambda _seconds: None,
+        )
+    )
+
+    assert chunks[0]["choices"][0]["delta"]["content"] == "from logs"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_session_event_stream_formats_status_delta_and_decision():

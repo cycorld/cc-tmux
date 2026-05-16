@@ -273,8 +273,9 @@ print(response.choices[0].message.content)
 Streaming and operator endpoints:
 
 ```bash
-# Server-sent session events: status, capture_delta, and decision_required.
-curl -N 'http://127.0.0.1:19410/v1/sessions/app-worker/events?interval=1.0&n=120'
+# Server-sent session events: status plus structured Claude Code log events when available.
+# source=auto (default) prefers logs and falls back to capture_delta; use logs or capture to force one source.
+curl -N 'http://127.0.0.1:19410/v1/sessions/app-worker/events?interval=1.0&n=120&source=auto'
 
 # Plan approval decisions, if Claude is paused at the approval UI.
 curl http://127.0.0.1:19410/v1/sessions/app-worker/decisions
@@ -286,7 +287,7 @@ curl -X POST http://127.0.0.1:19410/v1/sessions/app-worker/decisions \
 curl http://127.0.0.1:19410/v1/sessions/app-worker/artifacts
 ```
 
-OpenAI-compatible streaming works with `stream=true`; chunks contain transcript capture deltas in `choices[0].delta.content` and then `[DONE]`:
+OpenAI-compatible streaming works with `stream=true`; chunks contain parsed assistant text from Claude Code JSONL logs when available, otherwise transcript capture deltas in `choices[0].delta.content`, and then `[DONE]`:
 
 ```python
 from openai import OpenAI
@@ -304,7 +305,9 @@ for chunk in stream:
         print(delta, end="")
 ```
 
-Limitations: server mode is still an MVP. Authentication is not built in, chat completion content is a cleaned transcript tail/capture delta rather than a structured model answer, and readiness is based on tmux/TUI screen heuristics. Plan-decision posting sends the raw option key (`1`-`4`) plus `Enter`; option `4` feedback is best-effort because Claude's focused TUI can change across versions. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
+Structured Claude Code logs: when a known session has a project path, server mode checks Claude Code's internal JSONL logs under `~/.claude/projects/<encoded-project>/` (currently `/tmp/foo` maps to `-tmp-foo`). These logs are best-effort and undocumented; if they are missing or their format changes, `cc-tmux` falls back to tmux capture. Parsed log events include `assistant_text`, `tool_use`, `tool_result`, `plan`, `usage`, and `permission_mode`. Tool inputs redact large edit/write content by default, but file paths, prompts, plan text, and tool results may still be sensitive—do not expose server mode or log-derived SSE streams to untrusted clients.
+
+Limitations: server mode is still an MVP. Authentication is not built in, readiness is still based on tmux/TUI screen heuristics, and Claude Code's internal JSONL schema may change across versions. Plan-decision posting sends the raw option key (`1`-`4`) plus `Enter`; option `4` feedback is best-effort because Claude's focused TUI can change across versions. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
 
 ## State file
 

@@ -97,15 +97,17 @@ Endpoints mirror the CLI:
 - `GET /health`: readiness check.
 - `POST /v1/sessions`: start/reuse a Claude Code tmux worker with `project_path`, optional `name`, `prompt`, `permission_mode`, and `auto_trust`.
 - `GET /v1/sessions`, `GET /v1/sessions/{id}/status`, `GET /v1/sessions/{id}/capture?n=120`: inspect state and transcript tail. Status includes derived `state`: `stopped`, `awaiting_plan_approval`, `plan_mode`, `idle`, or `running`.
-- `GET /v1/sessions/{id}/events?interval=1.0&n=120`: SSE stream with `status`, `capture_delta`, and `decision_required` events.
+- `GET /v1/sessions/{id}/events?interval=1.0&n=120&source=auto`: SSE stream with `status` plus structured Claude Code log events (`assistant_text`, `tool_use`, `tool_result`, `plan`, `usage`, `permission_mode`) when available. `source=auto` falls back to `capture_delta`; `source=logs` or `source=capture` forces one source.
 - `POST /v1/sessions/{id}/messages`: send a prompt, optionally `wait_ready` until the prompt returns.
 - `POST /v1/sessions/{id}/interrupt` and `/key`: recover or operate focused TUI controls.
 - `GET/POST /v1/sessions/{id}/decisions`: list and answer pending plan-approval decisions. Default recommendation is option `2` (manual approve edits); posting sends the raw option key plus `Enter`.
 - `GET /v1/sessions/{id}/artifacts`: return git `status --short`, changed files, and `diff --stat` for the recorded project path.
 - `DELETE /v1/sessions/{id}`: ask Claude to exit and kill the tmux session if it remains live.
-- `POST /v1/chat/completions`: minimal OpenAI-compatible wrapper. `stream=true` returns SSE chat completion chunks from capture deltas followed by `[DONE]`. Put `project_path`, `session`, `permission_mode`, `wait_ready`, `timeout_seconds`, or `stream_interval` in `metadata`.
+- `POST /v1/chat/completions`: minimal OpenAI-compatible wrapper. Non-streaming responses and `stream=true` prefer parsed `assistant_text` from Claude Code JSONL logs and fall back to capture deltas/tails followed by `[DONE]`. Put `project_path`, `session`, `permission_mode`, `wait_ready`, `timeout_seconds`, or `stream_interval` in `metadata`.
 
-Server caveats: no built-in authentication, OpenAI-style assistant content is a cleaned transcript tail/capture delta, and readiness is a tmux/TUI heuristic rather than a formal Claude Code completion signal. Decision option `4` with feedback is best-effort because the focused Claude TUI can change. Keep the server bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
+Claude Code log parsing is best-effort. Server mode looks for internal JSONL files under `~/.claude/projects/<encoded-project>/` (for example `/tmp/foo` -> `-tmp-foo`). The schema is not a public Claude Code contract and may change across versions. `cc-tmux` redacts common Write/Edit content fields in tool inputs before emitting events, but paths, tool results, prompts, and plan text can still be sensitive.
+
+Server caveats: no built-in authentication, readiness is a tmux/TUI heuristic rather than a formal Claude Code completion signal, and log parsing falls back to capture when logs are unavailable. Decision option `4` with feedback is best-effort because the focused Claude TUI can change. Keep the server bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
 
 ## Plan mode operator guidance
 
