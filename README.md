@@ -55,6 +55,10 @@ cc-tmux start ~/projects/my-app --prompt "Read the repo and summarize the test s
 # Send another instruction later.
 cc-tmux send ~/projects/my-app "Implement the smallest safe fix and run tests."
 
+# Interrupt a busy Claude Code turn, wait for the prompt, then send a follow-up.
+cc-tmux interrupt ~/projects/my-app --wait-ready 10
+cc-tmux send ~/projects/my-app "Revise the plan: only inspect files for now."
+
 # See recent pane output and the prompt-done heuristic.
 cc-tmux status ~/projects/my-app
 
@@ -91,6 +95,41 @@ Sends text plus `Enter` to the Claude pane.
 
 ```bash
 cc-tmux send api-fix "Run pytest and fix failures."
+```
+
+If Claude is actively working, interrupt first and wait until the input prompt is visible before sending a follow-up. Live testing showed `Escape` interrupts an active Claude Code task; sending the next prompt too early can append it to the prior input line.
+
+```bash
+cc-tmux interrupt api-fix --wait-ready 10
+cc-tmux send api-fix "Stop the current approach and summarize what changed so far."
+```
+
+### `cc-tmux key <session_or_project> <KEY...>`
+
+Sends one or more tmux key names directly to the Claude pane using tmux argv, not a shell. Use this for TUI controls such as closing overlays, accepting prompts, or moving history.
+
+Examples:
+
+```bash
+cc-tmux key api-fix Escape
+cc-tmux key api-fix Up Enter
+cc-tmux key api-fix C-c
+```
+
+### `cc-tmux interrupt <session_or_project>`
+
+Convenience wrapper around `key` for interrupting a busy Claude Code turn. Default key: `Escape`.
+
+Options:
+
+- `--key KEY`: tmux key name to send instead of `Escape`, for example `C-c`.
+- `--wait-ready SECONDS`: after sending the key, poll `status` until `last_prompt_ready` is true or the timeout expires.
+
+Recommended follow-up workflow:
+
+```bash
+cc-tmux interrupt api-fix --wait-ready 10
+cc-tmux send api-fix "New instruction after interruption."
 ```
 
 ### `cc-tmux status <session_or_project> [--json]`
@@ -150,15 +189,32 @@ It maps project paths and session names to session records. tmux remains authori
 
 - Core tmux invocations use `subprocess.run([...], shell=False)`.
 - Session names are normalized to safe tmux-friendly names.
+- `cc-tmux key` and `cc-tmux interrupt` pass tmux key names as argv entries to `tmux send-keys`; they do not evaluate shell text.
 - `--permission-mode acceptEdits` is the practical default for automation but still delegates edit behavior to Claude Code.
 - `cc-tmux stop` is graceful by default. Use `--kill` only when you intentionally want to terminate tmux.
 - Prompts are sent literally as tmux key strings. Avoid sending secrets unless you trust the tmux host and scrollback.
+
+## Claude Code slash-command notes
+
+Live testing confirmed these Claude Code slash commands work inside a `cc-tmux`-controlled pane:
+
+- `/help`: displays Claude Code's command surface and currently includes `/btw`.
+- `/btw <question>`: asks a side question without derailing the main task. Example: `/btw What is 2+2? answer in one short sentence.` returned `2+2 equals 4.` The side-question overlay shows controls such as `Esc to close`; close it with `cc-tmux key SESSION Escape` before continuing automation.
+- `/loop`: loads the loop skill and asks for prompt/interval details. It may start durable or autonomous repeated actions, so use it only intentionally. When testing or dismissing overlays, send `cc-tmux key SESSION Escape`.
+
+Slash command prompts are still just text sent to Claude Code, for example:
+
+```bash
+cc-tmux send api-fix "/btw Is the current task blocked? Answer briefly."
+```
 
 ## Troubleshooting
 
 - `tmux binary not found`: install tmux and ensure it is on `PATH`.
 - `claude binary not found`: install Claude Code and verify `claude --version` works in the same shell.
 - Workspace trust prompt blocks progress: run `cc-tmux trust <session>` or use the default `--auto-trust` behavior.
+- Need to interrupt a busy turn: run `cc-tmux interrupt <session> --wait-ready 10`, confirm `last_prompt_ready: true`, then use `cc-tmux send` for the follow-up. If readiness times out, inspect with `cc-tmux capture <session> -n 120` before sending more text.
+- Overlay or slash-command panel stuck open: run `cc-tmux key <session> Escape`.
 - Status says `exists: false`: check `tmux list-sessions` and `cc-tmux list --json`.
 - ANSI-heavy output: prefer `cc-tmux capture --no-ansi`; control-mode streams can be noisy.
 - Need manual recovery: `tmux attach -t cc-tmux-your-session`.

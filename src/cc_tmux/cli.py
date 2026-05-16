@@ -78,6 +78,36 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_key(args: argparse.Namespace) -> int:
+    tmux = Tmux()
+    session = resolve_session(args.session_or_project, tmux)
+    tmux.send_keys(f"{session}:0.0", *args.keys)
+    print(f"sent keys to {session}: {' '.join(args.keys)}")
+    return 0
+
+
+def _wait_for_prompt_ready(identifier: str, *, timeout: float, interval: float = 0.5) -> bool:
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        payload = _status_payload(identifier)
+        if bool(payload.get("last_prompt_ready")):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+
+def cmd_interrupt(args: argparse.Namespace) -> int:
+    tmux = Tmux()
+    session = resolve_session(args.session_or_project, tmux)
+    tmux.send_keys(f"{session}:0.0", args.key)
+    print(f"sent interrupt key to {session}: {args.key}")
+    if args.wait_ready is not None:
+        ready = _wait_for_prompt_ready(session, timeout=args.wait_ready)
+        print(f"last_prompt_ready: {str(ready).lower()}")
+    return 0
+
+
 def _status_payload(identifier: str) -> dict[str, object]:
     tmux = Tmux()
     try:
@@ -282,6 +312,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("session_or_project")
     p.add_argument("prompt")
     p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("key", help="send tmux key names to a running session")
+    p.add_argument("session_or_project")
+    p.add_argument("keys", nargs="+", metavar="KEY", help="tmux key name, e.g. Escape, C-c, Enter")
+    p.set_defaults(func=cmd_key)
+
+    p = sub.add_parser(
+        "interrupt",
+        help="interrupt Claude Code and optionally wait for prompt readiness",
+    )
+    p.add_argument("session_or_project")
+    p.add_argument("--key", default="Escape", help="tmux key name to send. Default: Escape")
+    p.add_argument(
+        "--wait-ready",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="poll status until last_prompt_ready or timeout before returning",
+    )
+    p.set_defaults(func=cmd_interrupt)
 
     p = sub.add_parser("status", help="show session state and recent pane capture")
     p.add_argument("session_or_project")

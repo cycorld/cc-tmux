@@ -31,6 +31,19 @@ Send work:
 cc-tmux send project-worker "Implement the requested change, run tests, and summarize results."
 ```
 
+Interrupt a busy turn before changing direction:
+
+```bash
+cc-tmux interrupt project-worker --wait-ready 10
+cc-tmux send project-worker "New instruction after the interrupted turn."
+```
+
+Send TUI keys such as `Escape`, `C-c`, or `Enter` when you need overlay/control behavior:
+
+```bash
+cc-tmux key project-worker Escape
+```
+
 Check progress:
 
 ```bash
@@ -66,7 +79,24 @@ Pitfalls:
 
 - Do not assume `/workspace`; pass the real repository path.
 - If Claude shows a trust prompt, run `cc-tmux trust hermes-app`.
+- If Claude is busy and the operator needs to redirect it, run `cc-tmux interrupt hermes-app --wait-ready 10` first, then send the follow-up with `cc-tmux send`. Sending follow-ups too early can append text to an old input line.
+- Close Claude Code overlays and side panels with `cc-tmux key hermes-app Escape`.
 - Capture output is for status, not a formal API contract.
+
+## Claude Code slash commands and overlays
+
+Claude Code slash commands can be driven through `cc-tmux send`:
+
+```bash
+cc-tmux send project-worker "/btw Is there a simpler approach? Answer briefly."
+```
+
+Operator guidance:
+
+- Use `/btw <question>` for a side question while preserving the main task context. Live testing showed `/btw What is 2+2? answer in one short sentence.` produced `2+2 equals 4.`
+- `/btw` and other slash commands may open overlays with controls such as `Esc to close`; close them with `cc-tmux key SESSION Escape` before continuing automated sends.
+- `/loop` loads/starts the looping skill and can lead to durable or autonomous repeated actions. Use it only intentionally, with explicit prompt and interval instructions, and close test overlays with `cc-tmux key SESSION Escape`.
+- `/help` is useful for discovering the currently available command surface.
 
 ## Claude Code as the controlled worker
 

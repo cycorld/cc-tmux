@@ -7,12 +7,41 @@ from cc_tmux.cli import build_parser, main, wait_for_demo_result
 from cc_tmux.tmux import CCTmuxError
 
 
+class FakeCliTmux:
+    live = {"cc-tmux-demo"}
+    sent_keys: list[tuple[str, tuple[str, ...]]] = []
+    captures: list[str] = ["│ ❯ "]
+
+    def has_session(self, session_name):
+        return session_name in self.live
+
+    def send_keys(self, target, *keys):
+        self.sent_keys.append((target, keys))
+
+    def capture(self, target, lines=80, ansi=False):
+        return self.captures.pop(0) if self.captures else ""
+
+
 def test_parser_start_defaults():
     parser = build_parser()
     args = parser.parse_args(["start", "/tmp/project"])
     assert args.permission_mode == "acceptEdits"
     assert args.auto_trust is True
     assert args.claude_arg == []
+
+
+def test_parser_key_accepts_multiple_keys():
+    parser = build_parser()
+    args = parser.parse_args(["key", "demo", "Escape", "C-c", "Enter"])
+    assert args.session_or_project == "demo"
+    assert args.keys == ["Escape", "C-c", "Enter"]
+
+
+def test_parser_interrupt_defaults_to_escape():
+    parser = build_parser()
+    args = parser.parse_args(["interrupt", "demo"])
+    assert args.key == "Escape"
+    assert args.wait_ready is None
 
 
 def test_help_exits_success(capsys):
@@ -57,3 +86,42 @@ def test_status_missing_session_json_exits_success(monkeypatch, capsys):
     assert payload["exists"] is False
     assert payload["done"] is False
     assert payload["last_prompt_ready"] is False
+
+
+def test_key_command_sends_tmux_keys_without_shell(monkeypatch, capsys):
+    FakeCliTmux.sent_keys = []
+    monkeypatch.setattr(cli, "Tmux", FakeCliTmux)
+
+    exit_code = main(["key", "demo", "Escape", "C-c", "Enter"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert FakeCliTmux.sent_keys == [("cc-tmux-demo:0.0", ("Escape", "C-c", "Enter"))]
+    assert "sent keys to cc-tmux-demo: Escape C-c Enter" in captured.out
+
+
+def test_interrupt_sends_default_escape_and_waits_ready(monkeypatch, capsys):
+    FakeCliTmux.sent_keys = []
+    FakeCliTmux.captures = ["working...", "│ ❯ "]
+    monkeypatch.setattr(cli, "Tmux", FakeCliTmux)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    exit_code = main(["interrupt", "demo", "--wait-ready", "1"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert FakeCliTmux.sent_keys == [("cc-tmux-demo:0.0", ("Escape",))]
+    assert "sent interrupt key to cc-tmux-demo: Escape" in captured.out
+    assert "last_prompt_ready: true" in captured.out
+
+
+def test_interrupt_can_use_custom_key(monkeypatch, capsys):
+    FakeCliTmux.sent_keys = []
+    monkeypatch.setattr(cli, "Tmux", FakeCliTmux)
+
+    exit_code = main(["interrupt", "demo", "--key", "C-c"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert FakeCliTmux.sent_keys == [("cc-tmux-demo:0.0", ("C-c",))]
+    assert "sent interrupt key to cc-tmux-demo: C-c" in captured.out
