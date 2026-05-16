@@ -42,7 +42,8 @@ python -m pip install -e .
 For development:
 
 ```bash
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[server,dev]'
+ruff check .
 pytest
 ```
 
@@ -203,6 +204,73 @@ Creates a temporary workspace, starts Claude Code, asks it to create `CONTROL_MO
 ```bash
 cc-tmux demo --wait 10
 ```
+
+## Server mode: `cc-tmux serve`
+
+`cc-tmux serve` runs an optional FastAPI/uvicorn HTTP wrapper around the same tmux session primitives used by the CLI. Install the server extra first:
+
+```bash
+python -m pip install -e '.[server]'
+cc-tmux serve --host 127.0.0.1 --port 19410
+```
+
+If FastAPI or uvicorn are missing, the command exits with an install hint for `.[server]`.
+
+REST examples:
+
+```bash
+curl http://127.0.0.1:19410/health
+
+curl -X POST http://127.0.0.1:19410/v1/sessions \
+  -H 'content-type: application/json' \
+  -d '{"project_path":"/srv/repos/app","name":"app-worker","prompt":"Read the repo and wait."}'
+
+curl http://127.0.0.1:19410/v1/sessions
+curl http://127.0.0.1:19410/v1/sessions/app-worker/status
+curl 'http://127.0.0.1:19410/v1/sessions/app-worker/capture?n=120&ansi=false'
+
+curl -X POST http://127.0.0.1:19410/v1/sessions/app-worker/messages \
+  -H 'content-type: application/json' \
+  -d '{"content":"Run tests and summarize failures.","wait_ready":true,"timeout_seconds":120}'
+
+curl -X POST http://127.0.0.1:19410/v1/sessions/app-worker/interrupt \
+  -H 'content-type: application/json' \
+  -d '{"wait_ready":true,"timeout_seconds":10}'
+
+curl -X POST http://127.0.0.1:19410/v1/sessions/app-worker/key \
+  -H 'content-type: application/json' \
+  -d '{"keys":["Escape"]}'
+
+curl -X DELETE http://127.0.0.1:19410/v1/sessions/app-worker
+```
+
+Minimal OpenAI-compatible chat completions endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:19410/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model":"cc-tmux",
+    "messages":[{"role":"user","content":"Inspect this repository and summarize it."}],
+    "metadata":{"project_path":"/srv/repos/app","session":"app-worker","wait_ready":true}
+  }'
+```
+
+Python OpenAI SDK smoke-test shape:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="unused")
+response = client.chat.completions.create(
+    model="cc-tmux",
+    messages=[{"role": "user", "content": "Run pytest and summarize."}],
+    extra_body={"metadata": {"project_path": "/srv/repos/app", "session": "app-worker"}},
+)
+print(response.choices[0].message.content)
+```
+
+Limitations: server mode is an MVP. `stream=true` returns `501`, authentication is not built in, requests are synchronous, and chat completion content is a cleaned transcript tail rather than a structured model answer. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
 
 ## State file
 

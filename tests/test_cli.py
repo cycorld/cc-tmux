@@ -53,6 +53,13 @@ def test_parser_interrupt_can_disable_clear_and_settle():
     assert args.settle == 0
 
 
+def test_parser_serve_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["serve"])
+    assert args.host == "127.0.0.1"
+    assert args.port == 19410
+
+
 def test_help_exits_success(capsys):
     try:
         main(["--help"])

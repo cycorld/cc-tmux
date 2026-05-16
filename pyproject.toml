@@ -26,8 +26,13 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = [
+  "httpx>=0.24",
   "pytest>=7.4",
   "ruff>=0.4",
+]
+server = [
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
 ]
 
 [project.urls]

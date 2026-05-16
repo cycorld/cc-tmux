@@ -26,6 +26,19 @@ from .tmux import (
 )
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        from .server import run_server
+    except RuntimeError as exc:
+        raise CCTmuxError(str(exc)) from exc
+
+    try:
+        run_server(host=args.host, port=args.port)
+    except RuntimeError as exc:
+        raise CCTmuxError(str(exc)) from exc
+    return 0
+
+
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -407,6 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--permission-mode", default="acceptEdits")
     p.add_argument("--wait", type=float, default=5.0)
     p.set_defaults(func=cmd_demo)
+
+    p = sub.add_parser("serve", help="run the optional HTTP API server")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=19410)
+    p.set_defaults(func=cmd_serve)
     return parser
 
 

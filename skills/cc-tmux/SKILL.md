@@ -83,6 +83,27 @@ Pitfalls:
 - Close Claude Code overlays and side panels with `cc-tmux key hermes-app Escape`.
 - Capture output is for status, not a formal API contract.
 
+## Server mode operator guidance
+
+Use `cc-tmux serve` when a supervisor needs an HTTP API rather than shelling out for each action. Install optional server dependencies and run on localhost by default:
+
+```bash
+python -m pip install -e '/path/to/cc-tmux[server]'
+cc-tmux serve --host 127.0.0.1 --port 19410
+```
+
+Endpoints mirror the CLI:
+
+- `GET /health`: readiness check.
+- `POST /v1/sessions`: start/reuse a Claude Code tmux worker with `project_path`, optional `name`, `prompt`, `permission_mode`, and `auto_trust`.
+- `GET /v1/sessions`, `GET /v1/sessions/{id}/status`, `GET /v1/sessions/{id}/capture?n=120`: inspect state and transcript tail.
+- `POST /v1/sessions/{id}/messages`: send a prompt, optionally `wait_ready` until the prompt returns.
+- `POST /v1/sessions/{id}/interrupt` and `/key`: recover or operate focused TUI controls.
+- `DELETE /v1/sessions/{id}`: ask Claude to exit and kill the tmux session if it remains live.
+- `POST /v1/chat/completions`: minimal OpenAI-compatible non-streaming wrapper. Put `project_path`, `session`, `permission_mode`, `wait_ready`, or `timeout_seconds` in `metadata`.
+
+Server caveats: no built-in authentication, no streaming yet (`stream=true` returns `501`), synchronous request handling, and OpenAI-style assistant content is a cleaned transcript tail. Keep it bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
+
 ## Plan mode operator guidance
 
 Use plan mode when the supervisor wants Claude to propose steps without changing files yet. Live testing confirmed `/plan ...` and `--permission-mode plan` show a plan/approval flow and do not create the requested file before approval.
