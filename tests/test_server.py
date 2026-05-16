@@ -243,6 +243,61 @@ def test_session_rest_flow_uses_service():
     ) in service.calls
 
 
+class FakeStopTmux:
+    def __init__(self, live: set[str] | None = None) -> None:
+        self.live = live or set()
+        self.sent_keys: list[tuple[str, tuple[str, ...]]] = []
+        self.killed: list[str] = []
+
+    def list_sessions(self) -> list[str]:
+        return sorted(self.live)
+
+    def has_session(self, session_name: str) -> bool:
+        return session_name in self.live
+
+    def send_keys(self, target: str, *keys: str) -> None:
+        self.sent_keys.append((target, keys))
+
+    def kill_session(self, session_name: str) -> None:
+        self.killed.append(session_name)
+        self.live.discard(session_name)
+
+
+def test_service_stop_session_is_idempotent_for_missing_session(monkeypatch):
+    removed: list[str] = []
+    monkeypatch.setattr("cc_tmux.server.remove_record", lambda session: removed.append(session))
+    tmux = FakeStopTmux()
+    service = CCTmuxService(tmux=tmux)  # type: ignore[arg-type]
+
+    payload = service.stop_session("missing", wait_seconds=0)
+
+    assert payload == {
+        "session_id": "cc-tmux-missing",
+        "name": "cc-tmux-missing",
+        "session": "cc-tmux-missing",
+        "stopped": True,
+        "exists": False,
+        "existed": False,
+        "graceful": False,
+    }
+    assert tmux.sent_keys == []
+    assert tmux.killed == []
+    assert removed == ["cc-tmux-missing"]
+
+
+def test_delete_missing_session_returns_200(monkeypatch):
+    monkeypatch.setattr("cc_tmux.server.remove_record", lambda _session: None)
+    service = CCTmuxService(tmux=FakeStopTmux())  # type: ignore[arg-type]
+    client = TestClient(create_app(service))
+
+    response = client.delete("/v1/sessions/already-stopped")
+
+    assert response.status_code == 200
+    assert response.json()["session_id"] == "cc-tmux-already-stopped"
+    assert response.json()["stopped"] is True
+    assert response.json()["exists"] is False
+
+
 def test_chat_completions_non_stream_shape():
     client, service = make_client()
 

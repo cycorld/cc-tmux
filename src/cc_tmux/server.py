@@ -362,10 +362,14 @@ class CCTmuxService:
         return payload
 
     def stop_session(self, session_id: str, *, wait_seconds: float = 3.0) -> dict[str, Any]:
-        session = resolve_session(session_id, self.tmux)
+        try:
+            session = resolve_session(session_id, self.tmux)
+        except CCTmuxError:
+            session = normalize_session_name(session_id)
         target = f"{session}:0.0"
         graceful = False
-        if self.tmux.has_session(session):
+        existed = self.tmux.has_session(session)
+        if existed:
             self.tmux.send_keys(target, "/exit", "Enter")
             deadline = time.time() + max(wait_seconds, 0.0)
             while time.time() < deadline:
@@ -381,6 +385,8 @@ class CCTmuxService:
             "name": session,
             "session": session,
             "stopped": True,
+            "exists": False,
+            "existed": existed,
             "graceful": graceful,
         }
 
