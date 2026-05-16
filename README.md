@@ -270,7 +270,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Limitations: server mode is an MVP. `stream=true` returns `501`, authentication is not built in, requests are synchronous, and chat completion content is a cleaned transcript tail rather than a structured model answer. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
+Limitations: server mode is an MVP. `stream=true` returns `501`, authentication is not built in, requests are synchronous, and chat completion content is a cleaned transcript tail rather than a structured model answer. `wait_ready` waits for the captured pane to show a new turn lifecycle (screen changes, non-ready/busy state, then ready prompt again), but it remains a tmux/TUI heuristic rather than a formal Claude Code completion signal. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
 
 ## State file
 

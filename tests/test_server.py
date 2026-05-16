@@ -8,7 +8,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-from cc_tmux.server import create_app
+from cc_tmux.server import CCTmuxService, create_app
 
 
 class FakeService:
@@ -203,6 +203,66 @@ def test_chat_completions_non_stream_shape():
     assert payload["choices"][0]["message"]["content"].startswith("Transcript tail:")
     assert payload["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     assert service.calls[-1][0] == "chat_completion"
+
+
+class FakeWaitService(CCTmuxService):
+    def __init__(self, statuses: list[dict[str, Any]]) -> None:
+        self.statuses = statuses
+        self.seen: list[dict[str, Any]] = []
+
+    def status(self, session_id: str, *, lines: int = 80) -> dict[str, Any]:
+        assert session_id == "cc-tmux-demo"
+        assert lines == 120
+        payload = self.statuses.pop(0) if self.statuses else self.seen[-1]
+        self.seen.append(payload)
+        return payload
+
+
+def test_wait_for_new_turn_ready_ignores_stale_ready(monkeypatch):
+    service = FakeWaitService(
+        [
+            {"last_prompt_ready": True, "capture": "old ready\n│ ❯ "},
+            {"last_prompt_ready": False, "capture": "running new turn"},
+            {"last_prompt_ready": True, "capture": "assistant finished\n│ ❯ "},
+        ]
+    )
+    monkeypatch.setattr("cc_tmux.server.time.sleep", lambda _seconds: None)
+
+    assert service.wait_for_new_turn_ready(
+        "cc-tmux-demo",
+        timeout=5,
+        baseline_capture="old ready\n│ ❯ ",
+        interval=0,
+        settle_seconds=0,
+    ) is True
+
+    assert service.seen == [
+        {"last_prompt_ready": True, "capture": "old ready\n│ ❯ "},
+        {"last_prompt_ready": False, "capture": "running new turn"},
+        {"last_prompt_ready": True, "capture": "assistant finished\n│ ❯ "},
+    ]
+
+
+def test_wait_for_new_turn_ready_times_out_without_busy_lifecycle(monkeypatch):
+    service = FakeWaitService(
+        [
+            {"last_prompt_ready": True, "capture": "old ready\n│ ❯ "},
+            {"last_prompt_ready": True, "capture": "prompt echoed\n│ ❯ "},
+        ]
+    )
+    monotonic_values = iter([0.0, 0.0, 0.1, 1.1])
+    monkeypatch.setattr("cc_tmux.server.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr("cc_tmux.server.time.sleep", lambda _seconds: None)
+
+    assert service.wait_for_new_turn_ready(
+        "cc-tmux-demo",
+        timeout=1,
+        baseline_capture="old ready\n│ ❯ ",
+        interval=0,
+        settle_seconds=0,
+    ) is False
+
+    assert len(service.seen) == 2
 
 
 def test_chat_completions_rejects_streaming():

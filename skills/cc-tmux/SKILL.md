@@ -102,7 +102,7 @@ Endpoints mirror the CLI:
 - `DELETE /v1/sessions/{id}`: ask Claude to exit and kill the tmux session if it remains live.
 - `POST /v1/chat/completions`: minimal OpenAI-compatible non-streaming wrapper. Put `project_path`, `session`, `permission_mode`, `wait_ready`, or `timeout_seconds` in `metadata`.
 
-Server caveats: no built-in authentication, no streaming yet (`stream=true` returns `501`), synchronous request handling, and OpenAI-style assistant content is a cleaned transcript tail. Keep it bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
+Server caveats: no built-in authentication, no streaming yet (`stream=true` returns `501`), synchronous request handling, and OpenAI-style assistant content is a cleaned transcript tail. `wait_ready` waits for a new captured turn lifecycle (screen change, non-ready/busy state, then ready prompt again), but remains a tmux/TUI heuristic rather than a formal Claude Code completion signal. Keep it bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
 
 ## Plan mode operator guidance
 

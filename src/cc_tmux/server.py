@@ -170,10 +170,15 @@ class CCTmuxService:
         timeout_seconds: float = 120.0,
     ) -> dict[str, Any]:
         session = resolve_session(session_id, self.tmux)
+        before_status = self.status(session, lines=120) if wait_ready else None
         self.tmux.send_text(f"{session}:0.0", content)
         ready = None
         if wait_ready:
-            ready = self.wait_for_prompt_ready(session, timeout=timeout_seconds)
+            ready = self.wait_for_new_turn_ready(
+                session,
+                timeout=timeout_seconds,
+                baseline_capture=str((before_status or {}).get("capture") or ""),
+            )
         status = self.status(session)
         capture = self.capture(session, lines=120, ansi=False)["capture"]
         return {
@@ -286,6 +291,45 @@ class CCTmuxService:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "metadata": {"session": result.get("session"), "ready": result.get("ready")},
         }
+
+    def wait_for_new_turn_ready(
+        self,
+        session_id: str,
+        *,
+        timeout: float,
+        baseline_capture: str = "",
+        interval: float = 0.5,
+        settle_seconds: float = 0.5,
+    ) -> bool:
+        """Wait until a newly submitted turn has cycled back to the prompt.
+
+        ``last_prompt_ready`` is only a screen heuristic. Immediately after tmux sends a
+        prompt, Claude Code can still be painting the previous idle prompt for a short
+        moment. Returning on that stale state makes REST/OpenAI requests report success
+        before the assistant has started, let alone completed. To avoid that false
+        positive, require evidence of a new lifecycle: the capture must change from the
+        pre-send baseline, the pane must look not-ready/busy at least once, and only
+        then may a ready prompt complete the wait.
+        """
+        deadline = time.monotonic() + max(timeout, 0.0)
+        if settle_seconds > 0:
+            time.sleep(min(settle_seconds, max(0.0, deadline - time.monotonic())))
+
+        capture_changed = False
+        saw_not_ready = False
+        while True:
+            payload = self.status(session_id, lines=120)
+            capture = str(payload.get("capture") or "")
+            ready = bool(payload.get("last_prompt_ready"))
+            if capture != baseline_capture:
+                capture_changed = True
+            if capture_changed and not ready:
+                saw_not_ready = True
+            if capture_changed and saw_not_ready and ready:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
     def wait_for_prompt_ready(
         self,
