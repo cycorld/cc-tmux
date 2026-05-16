@@ -1,3 +1,4 @@
+import hmac
 import json
 import shutil
 import subprocess
@@ -32,6 +33,10 @@ from .tmux import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 19410
+OPENAI_MODELS = [
+    {"id": "claude-code", "object": "model", "owned_by": "cc-tmux"},
+    {"id": "cc-tmux/claude-code", "object": "model", "owned_by": "cc-tmux"},
+]
 PLAN_APPROVAL_DECISION = {
     "id": "plan_approval",
     "kind": "plan_approval",
@@ -794,7 +799,14 @@ def _assistant_content_from_capture(capture: str, *, max_chars: int = 6000) -> s
     return f"Transcript tail:\n{cleaned}"
 
 
-def create_app(service: CCTmuxService | None = None):
+def _authorized_bearer(authorization: str | None, api_key: str) -> bool:
+    if not authorization:
+        return False
+    scheme, _, token = authorization.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token, api_key)
+
+
+def create_app(service: CCTmuxService | None = None, *, api_key: str | None = None):
     try:
         from fastapi import FastAPI, HTTPException, Query, Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -806,14 +818,31 @@ def create_app(service: CCTmuxService | None = None):
 
     app = FastAPI(title="cc-tmux server", version="0.1.0")
     app.state.service = service or CCTmuxService()
+    app.state.auth_required = bool(api_key)
+
+    @app.middleware("http")
+    async def require_bearer_auth(request: Request, call_next):
+        if api_key and request.url.path.startswith("/v1/") and not _authorized_bearer(
+            request.headers.get("authorization"), api_key
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": "missing or invalid bearer token"}},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return await call_next(request)
 
     @app.exception_handler(CCTmuxError)
     async def handle_cc_tmux_error(_request, exc: CCTmuxError):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, object]:
+        return {"status": "ok", "auth_required": bool(api_key)}
+
+    @app.get("/v1/models")
+    def models() -> dict[str, Any]:
+        return {"object": "list", "data": OPENAI_MODELS}
 
     @app.post("/v1/sessions")
     def start_session(body: dict[str, Any]) -> dict[str, Any]:
@@ -959,7 +988,9 @@ def create_app(service: CCTmuxService | None = None):
     return app
 
 
-def run_server(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+def run_server(
+    *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, api_key: str | None = None
+) -> None:
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover - depends on optional extras
@@ -968,5 +999,5 @@ def run_server(*, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
             "python -m pip install -e '.[server]'"
         ) from exc
 
-    app = create_app()
+    app = create_app(api_key=api_key)
     uvicorn.run(app, host=host, port=port)

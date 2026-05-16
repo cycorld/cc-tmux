@@ -216,6 +216,14 @@ cc-tmux serve --host 127.0.0.1 --port 19410
 
 If FastAPI or uvicorn are missing, the command exits with an install hint for `.[server]`.
 
+By default, no authentication is required so localhost development and existing tests keep working. To require OpenAI-style bearer auth for every `/v1/*` endpoint, pass `--api-key` or set `CC_TMUX_API_KEY` (or another env var via `--api-key-env`). `/health` stays public and reports whether auth is enabled without exposing the key.
+
+```bash
+export CC_TMUX_API_KEY='replace-with-a-local-secret'
+cc-tmux serve --host 127.0.0.1 --port 19410 --api-key-env CC_TMUX_API_KEY
+curl -H "Authorization: Bearer $CC_TMUX_API_KEY" http://127.0.0.1:19410/v1/models
+```
+
 REST examples:
 
 ```bash
@@ -247,10 +255,12 @@ curl -X DELETE http://127.0.0.1:19410/v1/sessions/app-worker
 Minimal OpenAI-compatible chat completions endpoint:
 
 ```bash
+curl http://127.0.0.1:19410/v1/models
+
 curl -X POST http://127.0.0.1:19410/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model":"cc-tmux",
+    "model":"claude-code",
     "messages":[{"role":"user","content":"Inspect this repository and summarize it."}],
     "metadata":{"project_path":"/srv/repos/app","session":"app-worker","wait_ready":true}
   }'
@@ -261,9 +271,10 @@ Python OpenAI SDK smoke-test shape:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="unused")
+client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="replace-with-local-secret")
+print(client.models.list())
 response = client.chat.completions.create(
-    model="cc-tmux",
+    model="claude-code",
     messages=[{"role": "user", "content": "Run pytest and summarize."}],
     extra_body={"metadata": {"project_path": "/srv/repos/app", "session": "app-worker"}},
 )
@@ -292,9 +303,9 @@ OpenAI-compatible streaming works with `stream=true`; chunks contain parsed assi
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="unused")
+client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="replace-with-local-secret")
 stream = client.chat.completions.create(
-    model="cc-tmux",
+    model="claude-code",
     messages=[{"role": "user", "content": "Run pytest and summarize."}],
     stream=True,
     extra_body={"metadata": {"project_path": "/srv/repos/app", "session": "app-worker"}},
@@ -307,7 +318,22 @@ for chunk in stream:
 
 Structured Claude Code logs: when a known session has a project path, server mode checks Claude Code's internal JSONL logs under `~/.claude/projects/<encoded-project>/` (currently `/tmp/foo` maps to `-tmp-foo`). These logs are best-effort and undocumented; if they are missing or their format changes, `cc-tmux` falls back to tmux capture. Parsed log events include `assistant_text`, `tool_use`, `tool_result`, `plan`, `usage`, and `permission_mode`. Tool inputs redact large edit/write content by default, but file paths, prompts, plan text, and tool results may still be sensitive—do not expose server mode or log-derived SSE streams to untrusted clients.
 
-Limitations: server mode is still an MVP. Authentication is not built in, readiness is still based on tmux/TUI screen heuristics, and Claude Code's internal JSONL schema may change across versions. Plan-decision posting sends the raw option key (`1`-`4`) plus `Enter`; option `4` feedback is best-effort because Claude's focused TUI can change across versions. Do not expose the server on an untrusted network without an external auth/reverse-proxy layer.
+Systemd user service helpers install a unit at `~/.config/systemd/user/<name>.service`. The unit reads `EnvironmentFile=-%h/.config/cc-tmux/server.env` and runs `cc-tmux serve --api-key-env CC_TMUX_API_KEY`; install reloads systemd but does not start the service unless `--start` is passed.
+
+```bash
+mkdir -p ~/.config/cc-tmux
+printf 'CC_TMUX_API_KEY=%s\n' 'replace-with-a-local-secret' > ~/.config/cc-tmux/server.env
+chmod 600 ~/.config/cc-tmux/server.env
+cc-tmux service install --host 127.0.0.1 --port 19410 --name cc-tmux-api
+cc-tmux service start --name cc-tmux-api
+cc-tmux service status --name cc-tmux-api
+# later: cc-tmux service stop --name cc-tmux-api
+# remove: cc-tmux service uninstall --name cc-tmux-api
+```
+
+Hermes provider connection proposal: configure an OpenAI-compatible provider with `base_url=http://127.0.0.1:19410/v1`, `api_key=$CC_TMUX_API_KEY`, and model `claude-code` (or `cc-tmux/claude-code`) only after explicit operator approval. Do not blindly change Hermes model/provider config from this repo.
+
+Limitations: server mode is still pragmatic local-agent infrastructure. Bearer auth is optional and disabled when no key is configured; readiness is still based on tmux/TUI screen heuristics; and Claude Code's internal JSONL schema may change across versions. Plan-decision posting sends the raw option key (`1`-`4`) plus `Enter`; option `4` feedback is best-effort because Claude's focused TUI can change across versions. Do not expose the server on an untrusted network without auth and network controls.
 
 ## State file
 

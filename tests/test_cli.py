@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import cc_tmux.cli as cli
 from cc_tmux.cli import build_parser, main, wait_for_demo_result
@@ -58,6 +59,56 @@ def test_parser_serve_defaults():
     args = parser.parse_args(["serve"])
     assert args.host == "127.0.0.1"
     assert args.port == 19410
+    assert args.api_key is None
+    assert args.api_key_env == "CC_TMUX_API_KEY"
+
+
+def test_parser_service_install_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["service", "install"])
+    assert args.name == "cc-tmux-api"
+    assert args.host == "127.0.0.1"
+    assert args.port == 19410
+    assert args.api_key_env == "CC_TMUX_API_KEY"
+    assert args.env_file == "%h/.config/cc-tmux/server.env"
+    assert args.start is False
+
+
+def test_service_unit_content():
+    unit = cli.build_service_unit(
+        name="cc-tmux-api",
+        host="127.0.0.1",
+        port=19410,
+        api_key_env="CC_TMUX_API_KEY",
+        env_file="%h/.config/cc-tmux/server.env",
+        executable="/usr/local/bin/cc-tmux",
+    )
+
+    assert "EnvironmentFile=-%h/.config/cc-tmux/server.env" in unit
+    assert (
+        "ExecStart=/usr/local/bin/cc-tmux serve --host 127.0.0.1 --port 19410 "
+        "--api-key-env CC_TMUX_API_KEY"
+    ) in unit
+    assert "Restart=on-failure" in unit
+
+
+def test_service_install_writes_unit_and_reloads(monkeypatch, tmp_path, capsys):
+    calls = []
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        cli, "_run_systemctl", lambda *args: calls.append(args) or SimpleNamespace(returncode=0)
+    )
+    monkeypatch.setattr(cli, "_service_exec", lambda: "/tmp/bin/cc-tmux")
+
+    exit_code = main(["service", "install", "--host", "0.0.0.0", "--port", "19999"])
+
+    unit_path = tmp_path / "config" / "systemd" / "user" / "cc-tmux-api.service"
+    assert exit_code == 0
+    assert unit_path.exists()
+    unit = unit_path.read_text()
+    assert "ExecStart=/tmp/bin/cc-tmux serve --host 0.0.0.0 --port 19999" in unit
+    assert calls == [("daemon-reload",)]
+    assert "installed:" in capsys.readouterr().out
 
 
 def test_help_exits_success(capsys):

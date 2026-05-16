@@ -208,7 +208,40 @@ def test_health():
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "auth_required": False}
+
+
+def test_models_endpoint_openai_shape():
+    client, _service = make_client()
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert payload["data"][0] == {
+        "id": "claude-code",
+        "object": "model",
+        "owned_by": "cc-tmux",
+    }
+
+
+def test_v1_endpoints_are_unprotected_without_api_key():
+    client = TestClient(create_app(FakeService()))
+
+    assert client.get("/v1/sessions").status_code == 200
+
+
+def test_v1_endpoints_require_bearer_when_api_key_configured():
+    client = TestClient(create_app(FakeService(), api_key="secret"))
+
+    assert client.get("/health").json() == {"status": "ok", "auth_required": True}
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    response = client.get("/v1/models", headers={"Authorization": "Bearer secret"})
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["id"] == "claude-code"
 
 
 def test_session_rest_flow_uses_service():

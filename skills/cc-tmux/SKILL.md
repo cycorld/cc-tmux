@@ -92,6 +92,15 @@ python -m pip install -e '/path/to/cc-tmux[server]'
 cc-tmux serve --host 127.0.0.1 --port 19410
 ```
 
+For local OpenAI-compatible use, set bearer auth unless you are doing trusted localhost development only:
+
+```bash
+export CC_TMUX_API_KEY='replace-with-a-local-secret'
+cc-tmux serve --host 127.0.0.1 --port 19410 --api-key-env CC_TMUX_API_KEY
+```
+
+If no `--api-key` is passed and the `--api-key-env` variable is unset, `/v1/*` remains unauthenticated for compatibility. When a key is configured, send `Authorization: Bearer $CC_TMUX_API_KEY` (the OpenAI SDK does this from `api_key=`). `/health` stays public and reports `auth_required`.
+
 Endpoints mirror the CLI:
 
 - `GET /health`: readiness check.
@@ -103,11 +112,39 @@ Endpoints mirror the CLI:
 - `GET/POST /v1/sessions/{id}/decisions`: list and answer pending plan-approval decisions. Default recommendation is option `2` (manual approve edits); posting sends the raw option key plus `Enter`.
 - `GET /v1/sessions/{id}/artifacts`: return git `status --short`, changed files, and `diff --stat` for the recorded project path.
 - `DELETE /v1/sessions/{id}`: ask Claude to exit and kill the tmux session if it remains live.
+- `GET /v1/models`: OpenAI-compatible model list with `claude-code` and `cc-tmux/claude-code`.
 - `POST /v1/chat/completions`: minimal OpenAI-compatible wrapper. Non-streaming responses and `stream=true` prefer parsed `assistant_text` from Claude Code JSONL logs and fall back to capture deltas/tails followed by `[DONE]`. Put `project_path`, `session`, `permission_mode`, `wait_ready`, `timeout_seconds`, or `stream_interval` in `metadata`.
 
 Claude Code log parsing is best-effort. Server mode looks for internal JSONL files under `~/.claude/projects/<encoded-project>/` (for example `/tmp/foo` -> `-tmp-foo`). The schema is not a public Claude Code contract and may change across versions. `cc-tmux` redacts common Write/Edit content fields in tool inputs before emitting events, but paths, tool results, prompts, and plan text can still be sensitive.
 
-Server caveats: no built-in authentication, readiness is a tmux/TUI heuristic rather than a formal Claude Code completion signal, and log parsing falls back to capture when logs are unavailable. Decision option `4` with feedback is best-effort because the focused Claude TUI can change. Keep the server bound to `127.0.0.1` or protect it with an external auth/reverse proxy.
+OpenAI SDK shape:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:19410/v1", api_key="replace-with-a-local-secret")
+print(client.models.list())
+response = client.chat.completions.create(
+    model="claude-code",
+    messages=[{"role": "user", "content": "Run pytest and summarize."}],
+    extra_body={"metadata": {"project_path": "/srv/repos/app", "session": "app-worker"}},
+)
+```
+
+Systemd user helper:
+
+```bash
+mkdir -p ~/.config/cc-tmux
+printf 'CC_TMUX_API_KEY=%s\n' 'replace-with-a-local-secret' > ~/.config/cc-tmux/server.env
+chmod 600 ~/.config/cc-tmux/server.env
+cc-tmux service install --host 127.0.0.1 --port 19410 --name cc-tmux-api
+cc-tmux service start --name cc-tmux-api
+cc-tmux service status --name cc-tmux-api
+```
+
+Hermes provider connection proposal: after explicit operator approval, point an OpenAI-compatible provider at `base_url=http://127.0.0.1:19410/v1`, use `api_key=$CC_TMUX_API_KEY`, and model `claude-code` or `cc-tmux/claude-code`. Do not blindly change Hermes model/provider config from this repo.
+
+Server caveats: bearer auth is optional and disabled if no key is configured, readiness is a tmux/TUI heuristic rather than a formal Claude Code completion signal, and log parsing falls back to capture when logs are unavailable. Decision option `4` with feedback is best-effort because the focused Claude TUI can change. Keep the server bound to `127.0.0.1` or protect it with auth and network controls.
 
 ## Plan mode operator guidance
 

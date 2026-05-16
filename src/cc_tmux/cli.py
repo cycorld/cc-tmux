@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -25,6 +28,17 @@ from .tmux import (
     slugify_project,
 )
 
+DEFAULT_API_KEY_ENV = "CC_TMUX_API_KEY"
+DEFAULT_SERVICE_NAME = "cc-tmux-api"
+DEFAULT_ENV_FILE = "%h/.config/cc-tmux/server.env"
+
+
+def _api_key_from_args(args: argparse.Namespace) -> str | None:
+    if args.api_key:
+        return str(args.api_key)
+    env_name = args.api_key_env or DEFAULT_API_KEY_ENV
+    return os.environ.get(env_name)
+
 
 def cmd_serve(args: argparse.Namespace) -> int:
     try:
@@ -33,10 +47,107 @@ def cmd_serve(args: argparse.Namespace) -> int:
         raise CCTmuxError(str(exc)) from exc
 
     try:
-        run_server(host=args.host, port=args.port)
+        run_server(host=args.host, port=args.port, api_key=_api_key_from_args(args))
     except RuntimeError as exc:
         raise CCTmuxError(str(exc)) from exc
     return 0
+
+
+def systemd_user_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+
+
+def _unit_path(name: str) -> Path:
+    return systemd_user_dir() / f"{name}.service"
+
+
+def _service_exec() -> str:
+    executable = shutil.which("cc-tmux")
+    if executable:
+        return executable
+    return f"{shlex.quote(sys.executable)} -m cc_tmux"
+
+
+def build_service_unit(
+    *,
+    name: str,
+    host: str,
+    port: int,
+    api_key_env: str,
+    env_file: str,
+    executable: str | None = None,
+) -> str:
+    exec_prefix = shlex.quote(executable or _service_exec())
+    command = (
+        f"{exec_prefix} serve --host {shlex.quote(host)} --port {port} "
+        f"--api-key-env {shlex.quote(api_key_env)}"
+    )
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=cc-tmux OpenAI-compatible local agent endpoint",
+            "After=network.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            f"EnvironmentFile=-{env_file}",
+            f"ExecStart={command}",
+            "Restart=on-failure",
+            "RestartSec=2",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+    )
+
+
+def _run_systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["systemctl", "--user", *args], check=False, text=True)
+
+
+def cmd_service_install(args: argparse.Namespace) -> int:
+    unit_path = _unit_path(args.name)
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(
+        build_service_unit(
+            name=args.name,
+            host=args.host,
+            port=args.port,
+            api_key_env=args.api_key_env,
+            env_file=args.env_file,
+        )
+    )
+    print(f"installed: {unit_path}")
+    reload_result = _run_systemctl("daemon-reload")
+    if reload_result.returncode != 0:
+        raise CCTmuxError("systemctl --user daemon-reload failed")
+    if args.start:
+        start_result = _run_systemctl("start", f"{args.name}.service")
+        if start_result.returncode != 0:
+            raise CCTmuxError(f"systemctl --user start {args.name}.service failed")
+    return 0
+
+
+def cmd_service_uninstall(args: argparse.Namespace) -> int:
+    unit_path = _unit_path(args.name)
+    if unit_path.exists():
+        unit_path.unlink()
+        print(f"removed: {unit_path}")
+    else:
+        print(f"not installed: {unit_path}")
+    reload_result = _run_systemctl("daemon-reload")
+    if reload_result.returncode != 0:
+        raise CCTmuxError("systemctl --user daemon-reload failed")
+    return 0
+
+
+def cmd_service_status(args: argparse.Namespace) -> int:
+    return _run_systemctl("status", f"{args.name}.service", "--no-pager").returncode
+
+
+def cmd_service_action(args: argparse.Namespace) -> int:
+    return _run_systemctl(args.action, f"{args.name}.service").returncode
 
 
 def _print_json(payload: object) -> None:
@@ -424,7 +535,38 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", help="run the optional HTTP API server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=19410)
+    p.add_argument("--api-key", help="require this bearer token for /v1/* endpoints")
+    p.add_argument(
+        "--api-key-env",
+        default=DEFAULT_API_KEY_ENV,
+        help="environment variable containing bearer token. Default: CC_TMUX_API_KEY",
+    )
     p.set_defaults(func=cmd_serve)
+
+    service = sub.add_parser("service", help="manage the systemd user service for cc-tmux serve")
+    service_sub = service.add_subparsers(dest="service_command", required=True)
+
+    p = service_sub.add_parser("install", help="install the systemd user unit")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=19410)
+    p.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV)
+    p.add_argument("--name", default=DEFAULT_SERVICE_NAME)
+    p.add_argument("--env-file", default=DEFAULT_ENV_FILE)
+    p.add_argument("--start", action="store_true", help="start the user service after install")
+    p.set_defaults(func=cmd_service_install)
+
+    p = service_sub.add_parser("uninstall", help="remove the systemd user unit")
+    p.add_argument("--name", default=DEFAULT_SERVICE_NAME)
+    p.set_defaults(func=cmd_service_uninstall)
+
+    p = service_sub.add_parser("status", help="show systemd user service status")
+    p.add_argument("--name", default=DEFAULT_SERVICE_NAME)
+    p.set_defaults(func=cmd_service_status)
+
+    for action in ("start", "stop", "restart"):
+        p = service_sub.add_parser(action, help=f"{action} the systemd user service")
+        p.add_argument("--name", default=DEFAULT_SERVICE_NAME)
+        p.set_defaults(func=cmd_service_action, action=action)
     return parser
 
 
