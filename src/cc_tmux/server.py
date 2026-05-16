@@ -406,7 +406,7 @@ class CCTmuxService:
         ]
         if session_id is not None:
             structured = self.structured_events(session_id)
-            touched = _tool_touched_files(structured["events"])
+            touched = _tool_touched_files(structured["events"], project=project)
             payload["tool_touched_files"] = touched
             payload["changed_files"] = sorted(set(payload["changed_files"]) | set(touched))
         payload["diff_stat"] = diff_stat
@@ -474,6 +474,8 @@ class CCTmuxService:
     ) -> dict[str, Any]:
         metadata = metadata or {}
         session, content, _started = self._resolve_chat_target(messages, metadata)
+        baseline_structured = self.structured_events(session)
+        log_offset = int(baseline_structured.get("offset") or 0)
 
         result = self.send_message(
             session,
@@ -481,7 +483,7 @@ class CCTmuxService:
             wait_ready=bool(metadata.get("wait_ready", True)),
             timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
         )
-        structured = self.structured_events(session)
+        structured = self.structured_events(session, offset=log_offset)
         answer = extract_final_assistant_text(structured["events"])
         if not answer:
             answer = _assistant_content_from_capture(str(result.get("capture") or ""))
@@ -737,7 +739,7 @@ def _status_path(line: str) -> str:
     return path.strip()
 
 
-def _tool_touched_files(events: list[dict[str, Any]]) -> list[str]:
+def _tool_touched_files(events: list[dict[str, Any]], *, project: Path | None = None) -> list[str]:
     touched: set[str] = set()
     for event in events:
         if event.get("type") != "tool_use" or event.get("name") not in {
@@ -751,8 +753,21 @@ def _tool_touched_files(events: list[dict[str, Any]]) -> list[str]:
             continue
         path = input_value.get("file_path") or input_value.get("path")
         if isinstance(path, str) and path:
-            touched.add(path)
+            touched.add(_normalize_touched_path(path, project=project))
     return sorted(touched)
+
+
+def _normalize_touched_path(path: str, *, project: Path | None = None) -> str:
+    candidate = Path(path).expanduser()
+    if project is not None:
+        project = project.expanduser().resolve()
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=False)
+            try:
+                return resolved.relative_to(project).as_posix()
+            except ValueError:
+                return str(resolved)
+    return candidate.as_posix()
 
 
 def _last_user_content(messages: list[dict[str, Any]]) -> str:

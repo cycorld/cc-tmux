@@ -421,6 +421,48 @@ def test_service_chat_completion_uses_log_final_text():
     assert payload["metadata"]["log_path"] == "/tmp/fake.jsonl"
 
 
+class FakeScopedLogCompletionService(CCTmuxService):
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "do work", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "raw capture should not win",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        if offset == 0:
+            return {
+                "session_id": session_id,
+                "offset": 100,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [{"type": "assistant_text", "text": "old answer"}],
+            }
+        assert offset == 100
+        return {
+            "session_id": session_id,
+            "offset": 200,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [{"type": "assistant_text", "text": "current answer"}],
+        }
+
+
+def test_service_chat_completion_scopes_log_text_to_current_turn():
+    service = FakeScopedLogCompletionService()
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "do work"}],
+        metadata={"session": "cc-tmux-demo"},
+    )
+
+    assert payload["choices"][0]["message"]["content"] == "current answer"
+
+
 def test_chat_completions_streaming_sse_shape():
     client, service = make_client()
 
@@ -669,3 +711,52 @@ def test_service_artifacts_resolves_short_session_and_untracked_files(tmp_path, 
     assert payload["project_path"] == str(git_repo.resolve())
     assert payload["changed_files"] == ["REST_V02_OK.md"]
     assert "?? REST_V02_OK.md" in payload["git_status_short"]
+
+
+class FakeArtifactsLogService(CCTmuxService):
+    def __init__(self, touched_path: str) -> None:
+        self.touched_path = touched_path
+
+    def structured_events(self, session_id, offset=0):
+        return {
+            "session_id": session_id,
+            "offset": offset,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [
+                {
+                    "type": "tool_use",
+                    "name": "Write",
+                    "input": {"file_path": self.touched_path},
+                }
+            ],
+        }
+
+
+def test_service_artifacts_normalizes_absolute_tool_paths_and_dedupes(tmp_path):
+    git_repo = tmp_path / "repo"
+    git_repo.mkdir()
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=git_repo, check=True, capture_output=True)
+    written = git_repo / "LOG_NONSTREAM_OK.md"
+    written.write_text("created live\n")
+
+    service = FakeArtifactsLogService(str(written))
+    payload = service.artifacts("cc-tmux-demo", project_path=str(git_repo))
+
+    assert payload["changed_files"] == ["LOG_NONSTREAM_OK.md"]
+    assert payload["tool_touched_files"] == ["LOG_NONSTREAM_OK.md"]
+
+
+def test_service_artifacts_keeps_absolute_tool_paths_outside_project(tmp_path):
+    git_repo = tmp_path / "repo"
+    git_repo.mkdir()
+    outside = tmp_path / "outside.txt"
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=git_repo, check=True, capture_output=True)
+
+    service = FakeArtifactsLogService(str(outside))
+    payload = service.artifacts("cc-tmux-demo", project_path=str(git_repo))
+
+    assert payload["tool_touched_files"] == [str(outside)]
