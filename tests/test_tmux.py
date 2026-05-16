@@ -8,6 +8,7 @@ from cc_tmux.tmux import (
     claude_command,
     normalize_session_name,
     prompt_done_heuristic,
+    prompt_ready_heuristic,
     resolve_session,
     slugify_project,
 )
@@ -93,3 +94,28 @@ def test_prompt_done_heuristic_detects_prompt_tail():
     assert prompt_done_heuristic("work...\n> ")
     assert prompt_done_heuristic("Do you trust the files in this folder?")
     assert not prompt_done_heuristic("")
+
+
+def test_prompt_ready_heuristic_detects_claude_code_unicode_prompt():
+    capture = "\n".join(
+        [
+            "✻ Welcome to Claude Code",
+            "  Some prior output",
+            "╭────────────────────────────────────────────────────────╮",
+            "│ ❯ show me the file contents                            │",
+            "╰────────────────────────────────────────────────────────╯",
+        ]
+    )
+
+    assert prompt_ready_heuristic(capture)
+
+
+def test_prompt_ready_heuristic_ignores_old_history_outside_tail():
+    capture = "❯ historical prompt\n" + "\n".join(f"line {i}" for i in range(20))
+
+    assert not prompt_ready_heuristic(capture)
+
+
+def test_prompt_ready_heuristic_strips_ansi_and_detects_ascii_prompt():
+    assert prompt_ready_heuristic("working\n\x1b[36m│ > \x1b[0m")
+    assert not prompt_ready_heuristic("")

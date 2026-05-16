@@ -17,6 +17,7 @@ from .tmux import (
     known_records,
     normalize_session_name,
     prompt_done_heuristic,
+    prompt_ready_heuristic,
     resolve_session,
     slugify_project,
 )
@@ -93,12 +94,13 @@ def _status_payload(identifier: str) -> dict[str, object]:
         }
     exists = tmux.has_session(session)
     capture = tmux.capture(f"{session}:0.0", lines=80) if exists else ""
-    ready = prompt_done_heuristic(capture)
+    done = prompt_done_heuristic(capture)
+    ready = prompt_ready_heuristic(capture)
     return {
         "identifier": identifier,
         "session": session,
         "exists": exists,
-        "done": ready,
+        "done": done,
         "last_prompt_ready": ready,
         "capture": capture,
     }
@@ -116,7 +118,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if capture:
             print("--- capture ---")
             print(capture)
-    return 0 if payload["exists"] else 1
+    return 0
 
 
 def cmd_capture(args: argparse.Namespace) -> int:

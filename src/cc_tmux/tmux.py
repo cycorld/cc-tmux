@@ -18,6 +18,8 @@ _DONE_MARKERS = (
     "│ >",
     "> ",
 )
+_CLAUDE_PROMPT_RE = re.compile(r"^\s*(?:[│┃┆┊╎╏]\s*)?(?:❯|>|›)\s*(?:$|\S)")
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class CCTmuxError(RuntimeError):
@@ -141,6 +143,33 @@ def prompt_done_heuristic(capture: str) -> bool:
         return False
     tail = "\n".join(capture.splitlines()[-8:])
     return any(marker in tail for marker in _DONE_MARKERS)
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def prompt_ready_heuristic(capture: str) -> bool:
+    """Return True when a Claude Code TUI capture appears idle at its prompt.
+
+    Claude Code's tmux capture is a screen snapshot rather than structured state. In recent
+    versions the editable input line is commonly rendered with a unicode chevron prompt
+    (``❯``), sometimes inside box-drawing borders, while older/basic renderings may show
+    ``>`` or ``│ >``. Check only the visible tail to avoid matching historical prompt text.
+
+    This intentionally does not replace ``prompt_done_heuristic`` so the legacy ``done``
+    status field keeps its existing behavior.
+    """
+    if not capture.strip():
+        return False
+    tail_lines = [_strip_ansi(line).rstrip() for line in capture.splitlines()[-12:]]
+    for line in tail_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _CLAUDE_PROMPT_RE.search(stripped):
+            return True
+    return False
 
 
 def known_records() -> list[SessionRecord]:
