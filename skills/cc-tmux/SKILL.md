@@ -50,7 +50,7 @@ Hermes agents can call the CLI from shell tools. Recommended pattern:
 
 1. Start a named session per repository or user task.
 2. Store the session name in the parent task state.
-3. Poll `cc-tmux status --json` for `exists` and `done`.
+3. Poll `cc-tmux status --json` for `exists`; use `last_prompt_ready` (or legacy `done`) as the prompt-ready heuristic.
 4. Use `cc-tmux capture -n 80` for summaries sent back to Telegram.
 
 Example:
@@ -59,6 +59,8 @@ Example:
 cc-tmux start /home/cycorld/projects/app --name hermes-app --prompt "Investigate the failing CI job."
 cc-tmux status hermes-app --json
 ```
+
+For a self-check on a machine with live `tmux` and `claude`, run `cc-tmux demo --wait 30`. The demo now reports `result_file_exists` and `result_file` for `CONTROL_MODE_RESULT.md` in addition to the pane prompt-ready heuristic, so a completed file is visible even if the terminal prompt heuristic is conservative.
 
 Pitfalls:
 
@@ -176,6 +178,16 @@ Pitfalls:
 
 - Avoid mixing Windows paths with Linux tmux sessions.
 - Ensure `claude` is installed in WSL, not only in Windows.
+
+## Battle-test notes
+
+Recent local battle testing covered: initial `start --prompt`, follow-up `send`, project-path resolution, `list`, `capture --no-ansi`, invalid path errors, fallback `stop`, and the live `demo` workflow. Treat `status --json` as a lightweight operational signal rather than proof of task completion; for demos or file-producing tasks, also check the expected filesystem artifact.
+
+A deterministic asciinema cast is included in the repository:
+
+```bash
+asciinema play assets/cc-tmux-demo.cast
+```
 
 ## Operational checklist
 

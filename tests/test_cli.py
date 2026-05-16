@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cc_tmux.cli import build_parser, main
+from cc_tmux.cli import build_parser, main, wait_for_demo_result
 
 
 def test_parser_start_defaults():
@@ -18,3 +18,20 @@ def test_help_exits_success(capsys):
         assert exc.code == 0
     captured = capsys.readouterr()
     assert "Orchestrate Claude Code in tmux" in captured.out
+
+
+def test_demo_result_poll_reports_existing_file(tmp_path):
+    result = tmp_path / "CONTROL_MODE_RESULT.md"
+    result.write_text("done")
+
+    payload = wait_for_demo_result(result, timeout=0)
+
+    assert payload["result_file_exists"] is True
+    assert payload["result_wait_seconds"] >= 0
+
+
+def test_demo_result_poll_times_out_for_missing_file(tmp_path):
+    payload = wait_for_demo_result(tmp_path / "missing.md", timeout=0, interval=0.01)
+
+    assert payload["result_file_exists"] is False
+    assert payload["result_wait_seconds"] >= 0

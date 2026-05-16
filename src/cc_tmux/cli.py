@@ -88,15 +88,18 @@ def _status_payload(identifier: str) -> dict[str, object]:
             "session": session,
             "exists": False,
             "done": False,
+            "last_prompt_ready": False,
             "capture": "",
         }
     exists = tmux.has_session(session)
     capture = tmux.capture(f"{session}:0.0", lines=80) if exists else ""
+    ready = prompt_done_heuristic(capture)
     return {
         "identifier": identifier,
         "session": session,
         "exists": exists,
-        "done": prompt_done_heuristic(capture),
+        "done": ready,
+        "last_prompt_ready": ready,
         "capture": capture,
     }
 
@@ -212,12 +215,44 @@ def cmd_demo(args: argparse.Namespace) -> int:
         trust_delay=1.0,
     )
     cmd_start(start_args)
-    print("waiting briefly for Claude Code to begin...")
-    time.sleep(args.wait)
-    status = _status_payload(normalize_session_name(start_args.name))
-    _print_json({k: v for k, v in status.items() if k != "capture"})
+    session = normalize_session_name(start_args.name)
+    result_path = workspace / "CONTROL_MODE_RESULT.md"
+    print(f"waiting up to {args.wait:g}s for CONTROL_MODE_RESULT.md...")
+    result = wait_for_demo_result(result_path, timeout=args.wait)
+    status = _status_payload(session)
+    payload = {k: v for k, v in status.items() if k != "capture"}
+    payload.update(result)
+    payload["result_file"] = str(result_path)
+    if result_path.exists():
+        payload["result_preview"] = result_path.read_text(errors="replace")[:500]
+    _print_json(payload)
+    if not result["result_file_exists"]:
+        print(f"Result file not observed yet. Try: cc-tmux capture {session} -n 120")
     print("Run `cc-tmux capture SESSION` for the transcript or inspect:", workspace)
     return 0
+
+
+def wait_for_demo_result(
+    result_path: Path,
+    *,
+    timeout: float,
+    interval: float = 0.5,
+) -> dict[str, object]:
+    """Poll for the demo result file and report elapsed wait metadata."""
+    start = time.monotonic()
+    deadline = start + max(timeout, 0.0)
+    while True:
+        if result_path.exists():
+            return {
+                "result_file_exists": True,
+                "result_wait_seconds": round(time.monotonic() - start, 3),
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "result_file_exists": False,
+                "result_wait_seconds": round(time.monotonic() - start, 3),
+            }
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
 
 def build_parser() -> argparse.ArgumentParser:

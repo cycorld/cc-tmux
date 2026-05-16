@@ -2,6 +2,14 @@
 
 ![Animated cc-tmux terminal demo](assets/cc-tmux-demo.svg)
 
+Prefer an interactive terminal recording? Install [asciinema](https://asciinema.org/) and run:
+
+```bash
+asciinema play assets/cc-tmux-demo.cast
+```
+
+You can also convert the cast to GIF/SVG with tools such as `agg` if you need an embeddable artifact.
+
 `cc-tmux` is a dependency-light Python CLI for running [Claude Code](https://claude.ai/code) inside a tmux session and controlling it from another process. It is designed for developers and AI orchestrators that need a reliable, inspectable way to start Claude, send prompts, capture progress, and stop the session without scraping a fragile GUI.
 
 ## Why tmux Control Mode?
@@ -87,7 +95,7 @@ cc-tmux send api-fix "Run pytest and fix failures."
 
 ### `cc-tmux status <session_or_project> [--json]`
 
-Reports whether the tmux session exists, whether the pane appears ready for a prompt, and the latest capture snippet.
+Reports whether the tmux session exists, whether the pane appears ready for a prompt, and the latest capture snippet. JSON output includes both `done` (kept for compatibility) and `last_prompt_ready` for the prompt-ready heuristic.
 
 ```bash
 cc-tmux status . --json
@@ -122,7 +130,7 @@ Sends `Enter`, useful for accepting Claude Code's workspace trust prompt.
 
 ### `cc-tmux demo`
 
-Creates a temporary workspace, starts Claude Code, asks it to create `CONTROL_MODE_RESULT.md`, and prints status. This requires live `tmux` and `claude`.
+Creates a temporary workspace, starts Claude Code, asks it to create `CONTROL_MODE_RESULT.md`, polls for that file until `--wait`, and prints status plus `result_file_exists`, `result_file`, and a short preview when available. This requires live `tmux` and `claude`.
 
 ```bash
 cc-tmux demo --wait 10
@@ -184,6 +192,17 @@ cc-tmux status "$SESSION" --json
 ```
 
 If you need fully structured output, call `cc-tmux list --json` and `cc-tmux status --json` from your agent runtime.
+
+## Battle-tested scenarios
+
+Local battle testing covered:
+
+- Initial `start --prompt` creating a file in a project.
+- Follow-up `send` creating a second file.
+- Resolution by project path, `list`, and `capture --no-ansi`.
+- Graceful `stop` with fallback kill.
+- Clean failure for invalid project paths.
+- End-to-end `demo` against live `tmux` and `claude`.
 
 ## Development
 
