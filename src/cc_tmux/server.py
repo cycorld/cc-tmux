@@ -481,6 +481,7 @@ class CCTmuxService:
         session, content, _started = self._resolve_chat_target(messages, metadata)
         baseline_structured = self.structured_events(session)
         log_offset = int(baseline_structured.get("offset") or 0)
+        log_path = baseline_structured.get("log_path")
 
         result = self.send_message(
             session,
@@ -503,6 +504,7 @@ class CCTmuxService:
         structured = self._wait_for_assistant_log_text(
             session,
             offset=log_offset,
+            baseline_log_path=str(log_path) if log_path else None,
             timeout=float(metadata.get("log_settle_timeout", 3.0)),
         )
         answer = extract_final_assistant_text(structured["events"])
@@ -538,6 +540,7 @@ class CCTmuxService:
         session_id: str,
         *,
         offset: int,
+        baseline_log_path: str | None = None,
         timeout: float = 3.0,
         interval: float = 0.2,
     ) -> dict[str, Any]:
@@ -558,6 +561,16 @@ class CCTmuxService:
         }
         while True:
             latest = self.structured_events(session_id, offset=offset)
+            latest_log_path = latest.get("log_path")
+            if (
+                baseline_log_path
+                and latest_log_path
+                and str(latest_log_path) != baseline_log_path
+                and offset != 0
+            ):
+                latest = self.structured_events(session_id, offset=0)
+                offset = 0
+                baseline_log_path = str(latest_log_path)
             if extract_final_assistant_text(latest.get("events", [])):
                 return latest
             if time.monotonic() >= deadline:
@@ -575,6 +588,7 @@ class CCTmuxService:
         session, content, _started = self._resolve_chat_target(messages, metadata)
         structured = self.structured_events(session)
         log_offset = int(structured.get("offset") or 0)
+        log_path = structured.get("log_path")
         self.tmux.send_text(f"{session}:0.0", content)
         yield from openai_stream_events(
             model=model,
@@ -582,6 +596,7 @@ class CCTmuxService:
             status_func=lambda: self.status(session, lines=120),
             structured_events_func=lambda offset: self.structured_events(session, offset=offset),
             baseline_log_offset=log_offset,
+            baseline_log_path=str(log_path) if log_path else None,
             interval=float(metadata.get("stream_interval", 0.5)),
             timeout=float(metadata.get("timeout_seconds", 120.0)),
         )
@@ -713,6 +728,7 @@ def openai_stream_events(
     status_func: Callable[[], dict[str, Any]],
     structured_events_func: Callable[[int], dict[str, Any]] | None = None,
     baseline_log_offset: int = 0,
+    baseline_log_path: str | None = None,
     interval: float = 0.5,
     timeout: float = 120.0,
     sleep: Callable[[float], None] = time.sleep,
@@ -732,6 +748,16 @@ def openai_stream_events(
             saw_ready_after_work = True
         if structured_events_func is not None:
             structured = structured_events_func(log_offset)
+            current_log_path = structured.get("log_path")
+            if (
+                baseline_log_path
+                and current_log_path
+                and str(current_log_path) != baseline_log_path
+                and log_offset != 0
+            ):
+                structured = structured_events_func(0)
+                log_offset = 0
+                baseline_log_path = str(current_log_path)
             log_offset = int(structured.get("offset") or log_offset)
             for event in structured.get("events", []):
                 if event.get("type") == "assistant_text" and event.get("text"):

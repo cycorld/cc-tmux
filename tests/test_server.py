@@ -496,6 +496,67 @@ def test_service_chat_completion_scopes_log_text_to_current_turn():
     assert payload["choices"][0]["message"]["content"] == "current answer"
 
 
+class FakeRotatedLogCompletionService(CCTmuxService):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "Reply exactly: CLEAN-OK", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "╭─ Claude Code ─╮\nDrizzling…\n│ ❯ prompt",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        self.calls.append((session_id, offset))
+        if len(self.calls) == 1:
+            return {
+                "session_id": session_id,
+                "offset": 9634,
+                "log_path": "/tmp/old-session.jsonl",
+                "events": [{"type": "assistant_text", "text": "old answer"}],
+            }
+        if offset == 9634:
+            return {
+                "session_id": session_id,
+                "offset": 9634,
+                "log_path": "/tmp/new-session.jsonl",
+                "events": [],
+            }
+        assert offset == 0
+        return {
+            "session_id": session_id,
+            "offset": 500,
+            "log_path": "/tmp/new-session.jsonl",
+            "events": [{"type": "assistant_text", "text": "CLEAN-OK"}],
+        }
+
+
+def test_service_chat_completion_resets_offset_when_log_file_rotates():
+    service = FakeRotatedLogCompletionService()
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "Reply exactly: CLEAN-OK"}],
+        metadata={"session": "cc-tmux-demo", "log_settle_timeout": 0},
+    )
+
+    content = payload["choices"][0]["message"]["content"]
+    assert content == "CLEAN-OK"
+    for leaked in ("Claude Code", "Drizzling", "❯", "╭", "│"):
+        assert leaked not in content
+    assert service.calls == [
+        ("cc-tmux-demo", 0),
+        ("cc-tmux-demo", 9634),
+        ("cc-tmux-demo", 0),
+    ]
+
+
 class FakeNoLogTextCompletionService(CCTmuxService):
     def _resolve_chat_target(self, messages, metadata):
         return "cc-tmux-demo", "do work", {}
@@ -619,6 +680,49 @@ def test_session_event_stream_emits_log_events_before_capture_fallback():
     assert 'event: assistant_text\n' in events[1]
     assert '"text": "log text"' in events[1]
     assert not any("capture_delta" in event for event in events)
+
+
+def test_openai_stream_events_resets_offset_when_log_file_rotates():
+    statuses = iter(
+        [
+            {"exists": True, "last_prompt_ready": False, "capture": "╭─ Claude Code ─╮"},
+            {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+        ]
+    )
+    calls: list[int] = []
+
+    def structured(offset):
+        calls.append(offset)
+        if offset == 100:
+            return {"offset": 100, "log_path": "/tmp/new.jsonl", "events": []}
+        if offset == 0:
+            return {
+                "offset": 200,
+                "log_path": "/tmp/new.jsonl",
+                "events": [{"type": "assistant_text", "text": "CLEAN-OK"}],
+            }
+        return {"offset": offset, "log_path": "/tmp/new.jsonl", "events": []}
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=lambda: next(statuses),
+            structured_events_func=structured,
+            baseline_log_offset=100,
+            baseline_log_path="/tmp/old.jsonl",
+            interval=0,
+            timeout=5,
+            sleep=lambda _seconds: None,
+        )
+    )
+
+    combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert combined == "CLEAN-OK"
+    for leaked in ("Claude Code", "Drizzling", "❯", "╭", "│"):
+        assert leaked not in combined
+    assert calls == [100, 0, 200]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_openai_stream_events_prefers_log_text_over_capture():
