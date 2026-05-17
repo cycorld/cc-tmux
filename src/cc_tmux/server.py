@@ -623,6 +623,9 @@ class CCTmuxService:
             baseline_log_path=str(log_path) if log_path else None,
             interval=float(metadata.get("stream_interval", 0.5)),
             timeout=float(metadata.get("timeout_seconds", 120.0)),
+            stream_settle_seconds=float(
+                metadata.get("stream_settle_seconds", metadata.get("log_settle_seconds", 0.5))
+            ),
         )
 
     def wait_for_new_turn_ready(
@@ -755,6 +758,7 @@ def openai_stream_events(
     baseline_log_path: str | None = None,
     interval: float = 0.5,
     timeout: float = 120.0,
+    stream_settle_seconds: float = 0.5,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Iterator[dict[str, Any]]:
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -765,6 +769,8 @@ def openai_stream_events(
     emitted_text = False
     deadline = time.monotonic() + max(timeout, 0.0)
     assistant_settle_deadline: float | None = None
+    emitted_text_settle_deadline: float | None = None
+    stream_settle_seconds = max(stream_settle_seconds, 0.0)
     while True:
         status = with_state(status_func())
         ready = bool(status.get("last_prompt_ready"))
@@ -785,9 +791,13 @@ def openai_stream_events(
                 log_offset = 0
                 baseline_log_path = str(current_log_path)
             log_offset = int(structured.get("offset") or log_offset)
-            for event in structured.get("events", []):
+            events = structured.get("events", [])
+            if emitted_text and events:
+                emitted_text_settle_deadline = None
+            for event in events:
                 if event.get("type") == "assistant_text" and event.get("text"):
                     emitted_text = True
+                    emitted_text_settle_deadline = None
                     yield _openai_stream_chunk(
                         chunk_id=chunk_id,
                         created=created,
@@ -796,9 +806,16 @@ def openai_stream_events(
                         finish_reason=None,
                     )
         now = time.monotonic()
-        if saw_ready_after_work:
-            if emitted_text:
+        if emitted_text:
+            if saw_ready_after_work:
                 break
+            if emitted_text_settle_deadline is None:
+                emitted_text_settle_deadline = now + min(
+                    stream_settle_seconds, max(0.0, deadline - now)
+                )
+            if emitted_text_settle_deadline is not None and now >= emitted_text_settle_deadline:
+                break
+        elif saw_ready_after_work:
             if assistant_settle_deadline is None:
                 assistant_settle_deadline = now + min(3.0, max(0.0, deadline - now))
             elif now >= assistant_settle_deadline:
@@ -808,6 +825,8 @@ def openai_stream_events(
         sleep_until = deadline
         if assistant_settle_deadline is not None:
             sleep_until = min(sleep_until, assistant_settle_deadline)
+        if emitted_text_settle_deadline is not None:
+            sleep_until = min(sleep_until, emitted_text_settle_deadline)
         sleep(min(max(interval, 0.0), max(0.0, sleep_until - time.monotonic())))
     if not emitted_text:
         yield _openai_stream_chunk(

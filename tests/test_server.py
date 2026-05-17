@@ -784,6 +784,85 @@ def test_openai_stream_events_prefers_log_text_over_capture():
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_openai_stream_events_settles_after_log_text_without_ready(monkeypatch):
+    statuses_seen = 0
+    sleeps: list[float] = []
+    monotonic_values = [0.0, 0.0, 0.2, 0.2, 0.7, 0.7]
+    monkeypatch.setattr(
+        "cc_tmux.server.time.monotonic",
+        lambda: monotonic_values.pop(0) if monotonic_values else 0.7,
+    )
+
+    def status():
+        nonlocal statuses_seen
+        statuses_seen += 1
+        return {
+            "exists": True,
+            "last_prompt_ready": False,
+            "capture": "╭─ Claude Code ─╮\nDrizzling…",
+        }
+
+    def structured(offset):
+        if offset == 0:
+            return {
+                "offset": 10,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [{"type": "assistant_text", "text": "STREAM-OK"}],
+            }
+        return {"offset": offset, "log_path": "/tmp/fake.jsonl", "events": []}
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=status,
+            structured_events_func=structured,
+            interval=0.2,
+            timeout=160,
+            stream_settle_seconds=0.5,
+            sleep=lambda seconds: sleeps.append(seconds),
+        )
+    )
+
+    combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert combined == "STREAM-OK"
+    for leaked in ("Claude Code", "Drizzling", "❯", "╭", "│"):
+        assert leaked not in combined
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert statuses_seen == 3
+    assert sum(sleeps) < 1.0
+
+
+def test_openai_stream_events_settle_seconds_zero_finishes_immediately_after_log_text():
+    statuses_seen = 0
+
+    def status():
+        nonlocal statuses_seen
+        statuses_seen += 1
+        return {"exists": True, "last_prompt_ready": False, "capture": "busy tui"}
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=status,
+            structured_events_func=lambda offset: {
+                "offset": offset + 10,
+                "events": [{"type": "assistant_text", "text": "FAST"}],
+            },
+            interval=0,
+            timeout=160,
+            stream_settle_seconds=0,
+            sleep=lambda _seconds: None,
+        )
+    )
+
+    combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert combined == "FAST"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert statuses_seen == 1
+
+
 def test_session_event_stream_formats_status_delta_and_decision():
     statuses = iter(
         [
