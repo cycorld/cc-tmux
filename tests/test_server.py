@@ -8,7 +8,14 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
-from cc_tmux.server import CCTmuxService, create_app, openai_stream_events, session_event_stream
+from cc_tmux.server import (
+    CCTmuxService,
+    _assistant_log_fallback,
+    _AssistantTurnTracker,
+    create_app,
+    openai_stream_events,
+    session_event_stream,
+)
 
 
 class FakeService:
@@ -710,6 +717,58 @@ def test_service_chat_completion_tool_result_without_assistant_text_uses_safe_fa
     for leaked in ("Claude Code", "❯", "╭", "│"):
         assert leaked not in content
     assert service.calls >= 3
+
+
+def test_assistant_log_fallback_handles_raw_claude_tool_reference_result():
+    events = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_search",
+                        "name": "ToolSearch",
+                        "input": {"query": "gmail email list"},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_search",
+                        "content": [
+                            {
+                                "type": "tool_reference",
+                                "tool_name": "mcp__claude_ai_Gmail__search_threads",
+                            }
+                        ],
+                    }
+                ],
+            },
+            "toolUseResult": {
+                "matches": ["mcp__claude_ai_Gmail__search_threads"],
+                "query": "gmail email list",
+            },
+        },
+    ]
+
+    tracker = _AssistantTurnTracker()
+    tracker.update(events)
+    fallback = _assistant_log_fallback(events, "/tmp/fake.jsonl")
+
+    assert tracker.saw_tool_or_mcp_activity is True
+    assert tracker.in_progress is True
+    assert "No assistant text was found" not in fallback
+    assert "loaded the requested MCP tools" in fallback
+    assert "mcp__claude_ai_Gmail" not in fallback
 
 
 class FakeNoLogTextCompletionService(CCTmuxService):

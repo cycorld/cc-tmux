@@ -98,33 +98,58 @@ class _AssistantTurnTracker:
         self.events.extend(events)
         for event in events:
             event_type = str(event.get("type") or "")
-            if event_type == "tool_use":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            raw_items = message.get("content") if isinstance(message.get("content"), list) else []
+            raw_tool_uses = [
+                item
+                for item in raw_items
+                if isinstance(item, dict) and item.get("type") == "tool_use"
+            ]
+            raw_tool_results = [
+                item
+                for item in raw_items
+                if isinstance(item, dict) and item.get("type") == "tool_result"
+            ]
+            raw_text_items = [
+                item for item in raw_items if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            if event_type == "tool_use" or raw_tool_uses:
                 self.saw_tool_or_mcp_activity = True
                 self.saw_assistant_text_after_activity = False
-                tool_use_id = event.get("tool_use_id")
-                if isinstance(tool_use_id, str) and tool_use_id:
-                    self.pending_tool_use_ids.add(tool_use_id)
-                else:
-                    self.open_tool_uses += 1
-            elif event_type == "tool_result":
+                tool_ids = [event.get("tool_use_id")] + [item.get("id") for item in raw_tool_uses]
+                for tool_use_id in tool_ids:
+                    if isinstance(tool_use_id, str) and tool_use_id:
+                        self.pending_tool_use_ids.add(tool_use_id)
+                    else:
+                        self.open_tool_uses += 1
+            elif event_type == "tool_result" or raw_tool_results:
                 self.saw_tool_or_mcp_activity = True
                 self.saw_assistant_text_after_activity = False
-                tool_use_id = event.get("tool_use_id")
-                if isinstance(tool_use_id, str) and tool_use_id:
-                    self.pending_tool_use_ids.discard(tool_use_id)
-                elif self.open_tool_uses > 0:
-                    self.open_tool_uses -= 1
+                tool_ids = [event.get("tool_use_id")] + [
+                    item.get("tool_use_id") for item in raw_tool_results
+                ]
+                for tool_use_id in tool_ids:
+                    if isinstance(tool_use_id, str) and tool_use_id:
+                        self.pending_tool_use_ids.discard(tool_use_id)
+                    elif self.open_tool_uses > 0:
+                        self.open_tool_uses -= 1
             elif event_type == "usage":
                 stop_reason = event.get("stop_reason")
                 self.last_usage_stop_reason = str(stop_reason) if stop_reason else None
                 if self.last_usage_stop_reason in {"tool_use", "pause_turn", "max_tokens"}:
                     self.saw_tool_or_mcp_activity = True
+            elif message.get("stop_reason"):
+                self.last_usage_stop_reason = str(message.get("stop_reason"))
+                if self.last_usage_stop_reason in {"tool_use", "pause_turn", "max_tokens"}:
+                    self.saw_tool_or_mcp_activity = True
             elif _is_background_tool_event(event):
                 self.saw_tool_or_mcp_activity = True
                 self.saw_assistant_text_after_activity = False
-            elif event_type == "assistant_text" and event.get("text"):
-                if self.saw_tool_or_mcp_activity:
-                    self.saw_assistant_text_after_activity = True
+            if self.saw_tool_or_mcp_activity and (
+                (event_type == "assistant_text" and event.get("text"))
+                or (event_type == "assistant" and raw_text_items)
+            ):
+                self.saw_assistant_text_after_activity = True
 
     @property
     def has_pending_tool_use(self) -> bool:
@@ -1013,17 +1038,37 @@ def _assistant_log_fallback(events: list[dict[str, Any]], log_path: Any) -> str:
 
 def _latest_tool_result_content(events: list[dict[str, Any]]) -> str:
     for event in reversed(events):
-        if event.get("type") != "tool_result":
-            continue
-        content = _sanitize_tool_result_content(event.get("content"))
-        if content:
-            return content
+        if event.get("type") == "tool_result":
+            content = _sanitize_tool_result_content(event.get("content"))
+            if content:
+                return content
+
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        items = message.get("content") if isinstance(message.get("content"), list) else []
+        for item in reversed(items):
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            content = _sanitize_tool_result_content(item.get("content"))
+            if content:
+                return content
+
+        tool_use_result = event.get("toolUseResult")
+        if tool_use_result:
+            content = _sanitize_tool_result_content(tool_use_result)
+            if content:
+                return content
     return ""
 
 
 def _sanitize_tool_result_content(content: Any, *, max_chars: int = 4000) -> str:
     if content is None:
         return ""
+    if _is_tool_reference_list(content):
+        return (
+            "Claude Code loaded the requested MCP tools, but did not emit a final assistant "
+            "message after the tool discovery step. Please retry the request or continue the "
+            "same session."
+        )
     text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
     text = text.replace("\x1b", "")
     text = "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n"))
@@ -1031,6 +1076,14 @@ def _sanitize_tool_result_content(content: Any, *, max_chars: int = 4000) -> str
     if len(text) > max_chars:
         return text[: max_chars - 1].rstrip() + "…"
     return text
+
+
+def _is_tool_reference_list(content: Any) -> bool:
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and all(isinstance(item, dict) and item.get("type") == "tool_reference" for item in content)
+    )
 
 
 def _looks_like_tui_chrome(line: str) -> bool:
@@ -1042,10 +1095,22 @@ def _looks_like_tui_chrome(line: str) -> bool:
 
 
 def _events_include_tool_or_mcp_activity(events: list[dict[str, Any]]) -> bool:
-    return any(
-        event.get("type") in {"tool_use", "tool_result"} or _is_background_tool_event(event)
-        for event in events
-    )
+    for event in events:
+        if event.get("type") in {"tool_use", "tool_result"} or _is_background_tool_event(event):
+            return True
+        if event.get("toolUseResult"):
+            return True
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        items = message.get("content") if isinstance(message.get("content"), list) else []
+        if any(
+            isinstance(item, dict) and item.get("type") in {"tool_use", "tool_result"}
+            for item in items
+        ):
+            return True
+        stop_reason = message.get("stop_reason")
+        if stop_reason in {"tool_use", "pause_turn", "max_tokens"}:
+            return True
+    return False
 
 
 def _empty_assistant_log_message(log_path: Any) -> str:
