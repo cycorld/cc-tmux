@@ -12,6 +12,7 @@ from cc_tmux.server import (
     CCTmuxService,
     _assistant_log_fallback,
     _AssistantTurnTracker,
+    _default_openai_session_name,
     create_app,
     openai_stream_events,
     session_event_stream,
@@ -769,6 +770,115 @@ def test_assistant_log_fallback_handles_raw_claude_tool_reference_result():
     assert "No assistant text was found" not in fallback
     assert "loaded the requested MCP tools" in fallback
     assert "mcp__claude_ai_Gmail" not in fallback
+
+
+class FakeToolReferenceContinuationService(CCTmuxService):
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.calls = 0
+
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "최근 메일 확인해줘.", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        self.sent.append(content)
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "ready",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "session_id": session_id,
+                "offset": 100,
+                "events": [],
+                "log_path": "/tmp/fake.jsonl",
+            }
+        if self.calls == 2:
+            return {
+                "session_id": session_id,
+                "offset": 300,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_search",
+                                    "name": "ToolSearch",
+                                }
+                            ],
+                            "stop_reason": "tool_use",
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_search",
+                                    "content": [
+                                        {
+                                            "type": "tool_reference",
+                                            "tool_name": "mcp__claude_ai_Gmail__search_threads",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                ],
+            }
+        return {
+            "session_id": session_id,
+            "offset": 500,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "최근 메일 요약 완료"}],
+                        "stop_reason": "end_turn",
+                    },
+                }
+            ],
+        }
+
+
+def test_service_chat_completion_auto_continues_tool_reference_only_result():
+    service = FakeToolReferenceContinuationService()
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "최근 메일 확인해줘."}],
+        metadata={
+            "session": "cc-tmux-demo",
+            "log_settle_timeout": 0,
+            "tool_search_continue_timeout": 0,
+        },
+    )
+
+    content = payload["choices"][0]["message"]["content"]
+    assert content == "최근 메일 요약 완료"
+    assert service.sent[0] == "최근 메일 확인해줘."
+    assert "immediately preceding turn only loaded MCP tool references" in service.sent[1]
+    assert "No assistant text was found" not in content
+
+
+def test_default_openai_session_name_is_stable_for_project_path():
+    assert _default_openai_session_name("/tmp") == _default_openai_session_name("/tmp/../tmp")
+    assert _default_openai_session_name("/tmp").startswith("openai-")
 
 
 class FakeNoLogTextCompletionService(CCTmuxService):

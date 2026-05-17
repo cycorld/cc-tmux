@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import json
 import shutil
@@ -33,6 +34,17 @@ from .tmux import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 19410
+TOOL_SEARCH_CONTINUATION_PROMPT = "\n".join(
+    [
+        "Continue the previous request in this same Claude Code session.",
+        "",
+        "Your immediately preceding turn only loaded MCP tool references with ToolSearch ",
+        "and did not produce a final assistant answer. Use the MCP tools that were just ",
+        "loaded to complete the user's original request. Do not ask the user to repeat ",
+        "the request unless a required permission or account context is genuinely missing. ",
+        "Produce a final assistant answer for the user.",
+    ]
+)
 OPENAI_MODELS = [
     {"id": "claude-code", "object": "model", "owned_by": "cc-tmux"},
     {"id": "cc-tmux/claude-code", "object": "model", "owned_by": "cc-tmux"},
@@ -186,6 +198,11 @@ def _model_detail(model_id: str) -> dict[str, Any]:
         "root": "claude-code",
         "parent": None,
     }
+
+
+def _default_openai_session_name(project_path: str) -> str:
+    digest = hashlib.sha1(str(Path(project_path).resolve()).encode()).hexdigest()[:12]
+    return f"openai-{digest}"
 
 
 def _discovery_props() -> dict[str, Any]:
@@ -572,6 +589,8 @@ class CCTmuxService:
 
         session = metadata.get("session") or metadata.get("session_id")
         project_path = metadata.get("project_path")
+        if project_path and not session:
+            session = _default_openai_session_name(str(project_path))
         started: dict[str, Any] = {}
         if project_path:
             started = self.start_session(
@@ -623,7 +642,30 @@ class CCTmuxService:
             baseline_log_path=str(log_path) if log_path else None,
             timeout=float(metadata.get("log_settle_timeout", 3.0)),
         )
-        answer = extract_final_assistant_text(structured["events"])
+        answer = _extract_assistant_text(structured["events"])
+        if (
+            not answer
+            and bool(metadata.get("auto_continue_tool_search", True))
+            and _has_tool_reference_result(structured["events"])
+        ):
+            continuation_offset = int(structured.get("offset") or log_offset)
+            continuation_log_path = structured.get("log_path") or log_path
+            self.send_message(
+                session,
+                content=TOOL_SEARCH_CONTINUATION_PROMPT,
+                wait_ready=bool(metadata.get("wait_ready", True)),
+                timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
+            )
+            continued = self._wait_for_assistant_log_text(
+                session,
+                offset=continuation_offset,
+                baseline_log_path=str(continuation_log_path) if continuation_log_path else None,
+                timeout=float(metadata.get("tool_search_continue_timeout", 30.0)),
+            )
+            continued_answer = _extract_assistant_text(continued["events"])
+            if continued_answer:
+                structured = continued
+                answer = continued_answer
         if not answer:
             answer = _assistant_log_fallback(structured["events"], structured.get("log_path"))
         now = int(time.time())
@@ -1036,6 +1078,22 @@ def _assistant_log_fallback(events: list[dict[str, Any]], log_path: Any) -> str:
     return _empty_assistant_log_message(log_path)
 
 
+def _extract_assistant_text(events: list[dict[str, Any]]) -> str:
+    normalized = extract_final_assistant_text(events)
+    if normalized:
+        return normalized
+    raw_parts: list[str] = []
+    for event in events:
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        if message.get("role") != "assistant":
+            continue
+        items = message.get("content") if isinstance(message.get("content"), list) else []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                raw_parts.append(str(item.get("text")))
+    return "\n".join(raw_parts).strip()
+
+
 def _latest_tool_result_content(events: list[dict[str, Any]]) -> str:
     for event in reversed(events):
         if event.get("type") == "tool_result":
@@ -1084,6 +1142,22 @@ def _is_tool_reference_list(content: Any) -> bool:
         and bool(content)
         and all(isinstance(item, dict) and item.get("type") == "tool_reference" for item in content)
     )
+
+
+def _has_tool_reference_result(events: list[dict[str, Any]]) -> bool:
+    for event in events:
+        if _is_tool_reference_list(event.get("content")):
+            return True
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        items = message.get("content") if isinstance(message.get("content"), list) else []
+        for item in items:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "tool_result"
+                and _is_tool_reference_list(item.get("content"))
+            ):
+                return True
+    return False
 
 
 def _looks_like_tui_chrome(line: str) -> bool:
