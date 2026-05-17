@@ -500,10 +500,14 @@ class CCTmuxService:
                 timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
             )
 
-        structured = self.structured_events(session, offset=log_offset)
+        structured = self._wait_for_assistant_log_text(
+            session,
+            offset=log_offset,
+            timeout=float(metadata.get("log_settle_timeout", 3.0)),
+        )
         answer = extract_final_assistant_text(structured["events"])
         if not answer:
-            answer = _assistant_content_from_capture(str(result.get("capture") or ""))
+            answer = _empty_assistant_log_message(structured.get("log_path"))
         now = int(time.time())
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -529,6 +533,37 @@ class CCTmuxService:
         status = self.status(session_id, lines=120)
         return bool(status.get("awaiting_plan_approval"))
 
+    def _wait_for_assistant_log_text(
+        self,
+        session_id: str,
+        *,
+        offset: int,
+        timeout: float = 3.0,
+        interval: float = 0.2,
+    ) -> dict[str, Any]:
+        """Read current-turn structured events, briefly waiting for log flush.
+
+        OpenAI-compatible responses must be generated from Claude Code's JSONL
+        assistant text events. The tmux pane is only a control/status surface and
+        can contain TUI chrome (banner, spinner/status words, prompt glyphs, box
+        drawing, status bar). Never fall back to pane capture for answer content.
+        """
+
+        deadline = time.monotonic() + max(timeout, 0.0)
+        latest: dict[str, Any] = {
+            "session_id": session_id,
+            "events": [],
+            "offset": offset,
+            "log_path": None,
+        }
+        while True:
+            latest = self.structured_events(session_id, offset=offset)
+            if extract_final_assistant_text(latest.get("events", [])):
+                return latest
+            if time.monotonic() >= deadline:
+                return latest
+            time.sleep(min(max(interval, 0.0), max(0.0, deadline - time.monotonic())))
+
     def chat_completion_stream_events(
         self,
         *,
@@ -538,7 +573,6 @@ class CCTmuxService:
     ) -> Iterator[dict[str, Any]]:
         metadata = metadata or {}
         session, content, _started = self._resolve_chat_target(messages, metadata)
-        baseline = str(self.status(session, lines=120).get("capture") or "")
         structured = self.structured_events(session)
         log_offset = int(structured.get("offset") or 0)
         self.tmux.send_text(f"{session}:0.0", content)
@@ -548,7 +582,6 @@ class CCTmuxService:
             status_func=lambda: self.status(session, lines=120),
             structured_events_func=lambda offset: self.structured_events(session, offset=offset),
             baseline_log_offset=log_offset,
-            baseline_capture=baseline,
             interval=float(metadata.get("stream_interval", 0.5)),
             timeout=float(metadata.get("timeout_seconds", 120.0)),
         )
@@ -680,33 +713,28 @@ def openai_stream_events(
     status_func: Callable[[], dict[str, Any]],
     structured_events_func: Callable[[int], dict[str, Any]] | None = None,
     baseline_log_offset: int = 0,
-    baseline_capture: str = "",
     interval: float = 0.5,
     timeout: float = 120.0,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Iterator[dict[str, Any]]:
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    previous_capture = baseline_capture
     log_offset = baseline_log_offset
-    capture_changed = False
     saw_not_ready = False
-    saw_log_text = False
+    saw_ready_after_work = False
     deadline = time.monotonic() + max(timeout, 0.0)
     while True:
         status = with_state(status_func())
-        capture = str(status.get("capture") or "")
         ready = bool(status.get("last_prompt_ready"))
-        if capture != baseline_capture:
-            capture_changed = True
-        if capture_changed and not ready:
+        if not ready:
             saw_not_ready = True
+        if saw_not_ready and ready:
+            saw_ready_after_work = True
         if structured_events_func is not None:
             structured = structured_events_func(log_offset)
             log_offset = int(structured.get("offset") or log_offset)
             for event in structured.get("events", []):
                 if event.get("type") == "assistant_text" and event.get("text"):
-                    saw_log_text = True
                     yield _openai_stream_chunk(
                         chunk_id=chunk_id,
                         created=created,
@@ -714,17 +742,7 @@ def openai_stream_events(
                         content=str(event["text"]),
                         finish_reason=None,
                     )
-        delta = _capture_delta(previous_capture, capture)
-        if delta and not saw_log_text:
-            yield _openai_stream_chunk(
-                chunk_id=chunk_id,
-                created=created,
-                model=model,
-                content=delta,
-                finish_reason=None,
-            )
-        previous_capture = capture
-        if capture_changed and saw_not_ready and ready:
+        if saw_ready_after_work:
             break
         if time.monotonic() >= deadline:
             break
@@ -806,13 +824,9 @@ def _last_user_content(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _assistant_content_from_capture(capture: str, *, max_chars: int = 6000) -> str:
-    cleaned = capture.strip()
-    if not cleaned:
-        return "Transcript tail:"
-    if len(cleaned) > max_chars:
-        cleaned = cleaned[-max_chars:]
-    return f"Transcript tail:\n{cleaned}"
+def _empty_assistant_log_message(log_path: Any) -> str:
+    location = f" at {log_path}" if log_path else ""
+    return f"No assistant text was found in structured JSONL logs{location}."
 
 
 def _authorized_bearer(authorization: str | None, api_key: str) -> bool:

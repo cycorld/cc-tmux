@@ -351,7 +351,7 @@ def test_chat_completions_non_stream_shape():
     payload = response.json()
     assert payload["object"] == "chat.completion"
     assert payload["choices"][0]["message"]["role"] == "assistant"
-    assert payload["choices"][0]["message"]["content"].startswith("Transcript tail:")
+    assert payload["choices"][0]["message"]["content"] == "Transcript tail:\nassistant finished"
     assert payload["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     assert service.calls[-1][0] == "chat_completion"
 
@@ -496,6 +496,43 @@ def test_service_chat_completion_scopes_log_text_to_current_turn():
     assert payload["choices"][0]["message"]["content"] == "current answer"
 
 
+class FakeNoLogTextCompletionService(CCTmuxService):
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "do work", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "╭─ Claude Code ─╮\nDrizzling…\n│ ❯ prompt\nstatus bar",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        return {
+            "session_id": session_id,
+            "offset": 100,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [],
+        }
+
+
+def test_service_chat_completion_never_falls_back_to_tui_capture():
+    service = FakeNoLogTextCompletionService()
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "do work"}],
+        metadata={"session": "cc-tmux-demo", "log_settle_timeout": 0},
+    )
+
+    content = payload["choices"][0]["message"]["content"]
+    assert content == "No assistant text was found in structured JSONL logs at /tmp/fake.jsonl."
+    for leaked in ("Claude Code", "Drizzling", "❯", "╭", "│"):
+        assert leaked not in content
+
+
 def test_chat_completions_streaming_sse_shape():
     client, service = make_client()
 
@@ -609,7 +646,6 @@ def test_openai_stream_events_prefers_log_text_over_capture():
             session_id="cc-tmux-demo",
             status_func=lambda: next(statuses),
             structured_events_func=structured,
-            baseline_capture="old",
             interval=0,
             timeout=5,
             sleep=lambda _seconds: None,
@@ -651,12 +687,15 @@ def test_session_event_stream_formats_status_delta_and_decision():
     assert '"recommended_option": "2"' in events[-1]
 
 
-def test_openai_stream_events_yields_deltas_stop_chunk():
+def test_openai_stream_events_without_log_text_emits_no_tui_deltas():
     statuses = iter(
         [
-            {"exists": True, "last_prompt_ready": True, "capture": "old"},
-            {"exists": True, "last_prompt_ready": False, "capture": "old new"},
-            {"exists": True, "last_prompt_ready": True, "capture": "old new done"},
+            {
+                "exists": True,
+                "last_prompt_ready": False,
+                "capture": "╭─ Claude Code ─╮\nDrizzling…",
+            },
+            {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
         ]
     )
 
@@ -665,15 +704,17 @@ def test_openai_stream_events_yields_deltas_stop_chunk():
             model="cc-tmux",
             session_id="cc-tmux-demo",
             status_func=lambda: next(statuses),
-            baseline_capture="old",
+            structured_events_func=lambda offset: {"offset": offset, "events": []},
             interval=0,
             timeout=5,
             sleep=lambda _seconds: None,
         )
     )
 
-    assert chunks[0]["object"] == "chat.completion.chunk"
-    assert chunks[0]["choices"][0]["delta"]["content"] == " new"
+    assert all("content" not in chunk["choices"][0]["delta"] for chunk in chunks)
+    combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    for leaked in ("Claude Code", "Drizzling", "❯", "╭", "│"):
+        assert leaked not in combined
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 
