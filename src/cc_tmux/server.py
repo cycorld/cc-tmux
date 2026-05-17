@@ -99,7 +99,7 @@ class CCTmuxService:
         project_path: str,
         name: str | None = None,
         prompt: str | None = None,
-        permission_mode: str | None = "acceptEdits",
+        permission_mode: str | None = "auto",
         auto_trust: bool = True,
         startup_timeout: float = 15.0,
         trust_delay: float = 1.0,
@@ -462,7 +462,7 @@ class CCTmuxService:
                 project_path=str(project_path),
                 name=str(session) if session else None,
                 prompt=None,
-                permission_mode=metadata.get("permission_mode", "acceptEdits"),
+                permission_mode=metadata.get("permission_mode", "auto"),
                 auto_trust=bool(metadata.get("auto_trust", True)),
             )
             session = started["session_id"]
@@ -488,6 +488,18 @@ class CCTmuxService:
             wait_ready=bool(metadata.get("wait_ready", True)),
             timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
         )
+
+        # If Claude Code got stuck in Plan Approval mode, auto-accept and retry
+        if not result.get("ready") and self._is_awaiting_plan_approval(session):
+            self.post_decision(session, decision_id="plan_approval", option="1")
+            time.sleep(1)
+            result = self.send_message(
+                session,
+                content="",
+                wait_ready=True,
+                timeout_seconds=float(metadata.get("timeout_seconds", 120.0)),
+            )
+
         structured = self.structured_events(session, offset=log_offset)
         answer = extract_final_assistant_text(structured["events"])
         if not answer:
@@ -512,6 +524,10 @@ class CCTmuxService:
                 "log_path": structured.get("log_path"),
             },
         }
+
+    def _is_awaiting_plan_approval(self, session_id: str) -> bool:
+        status = self.status(session_id, lines=120)
+        return bool(status.get("awaiting_plan_approval"))
 
     def chat_completion_stream_events(
         self,
@@ -852,7 +868,7 @@ def create_app(service: CCTmuxService | None = None, *, api_key: str | None = No
             project_path=str(body["project_path"]),
             name=body.get("name"),
             prompt=body.get("prompt"),
-            permission_mode=body.get("permission_mode", "acceptEdits"),
+            permission_mode=body.get("permission_mode", "auto"),
             auto_trust=bool(body.get("auto_trust", True)),
         )
 
@@ -969,11 +985,25 @@ def create_app(service: CCTmuxService | None = None, *, api_key: str | None = No
             raise HTTPException(status_code=422, detail="model is required")
         if not isinstance(messages, list):
             raise HTTPException(status_code=422, detail="messages must be a list")
-        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+
+        # Support both direct "metadata" and OpenAI "extra_body.metadata"
+        meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        extra = body.get("extra_body")
+        if isinstance(extra, dict):
+            extra_meta = extra.get("metadata")
+            if isinstance(extra_meta, dict):
+                meta = {**meta, **extra_meta}
+
+        # Provide sane defaults so non-cc-tmux clients (Hermes, OpenAI SDK, etc.) work
+        if not meta.get("project_path"):
+            meta["project_path"] = "/tmp"
+        if not meta.get("session"):
+            meta["session"] = f"hermes-{uuid.uuid4().hex[:12]}"
+
         if body.get("stream") is True:
             def stream_generator():
                 for chunk in app.state.service.chat_completion_stream_events(
-                    model=model, messages=messages, metadata=metadata
+                    model=model, messages=messages, metadata=meta
                 ):
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -982,7 +1012,7 @@ def create_app(service: CCTmuxService | None = None, *, api_key: str | None = No
         return app.state.service.chat_completion(
             model=model,
             messages=messages,
-            metadata=metadata,
+            metadata=meta,
         )
 
     return app
