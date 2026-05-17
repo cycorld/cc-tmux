@@ -581,6 +581,70 @@ def test_service_chat_completion_resets_offset_when_log_file_rotates():
     ]
 
 
+class FakeToolTurnCompletionService(CCTmuxService):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "use a tool", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "tool finished, prompt ready",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "session_id": session_id,
+                "offset": 100,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [],
+            }
+        if self.calls == 2:
+            return {
+                "session_id": session_id,
+                "offset": 200,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [
+                    {"type": "tool_use", "tool_use_id": "toolu_1", "name": "mcp__demo__lookup"},
+                    {"type": "usage", "stop_reason": "tool_use"},
+                ],
+            }
+        if self.calls == 3:
+            return {
+                "session_id": session_id,
+                "offset": 300,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}],
+            }
+        return {
+            "session_id": session_id,
+            "offset": 400,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [{"type": "assistant_text", "text": "final answer after tool"}],
+        }
+
+
+def test_service_chat_completion_waits_through_tool_turn(monkeypatch):
+    service = FakeToolTurnCompletionService()
+    monkeypatch.setattr("cc_tmux.server.time.sleep", lambda _seconds: None)
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "use a tool"}],
+        metadata={"session": "cc-tmux-demo", "log_settle_timeout": 5},
+    )
+
+    assert payload["choices"][0]["message"]["content"] == "final answer after tool"
+    assert service.calls == 4
+
+
 class FakeNoLogTextCompletionService(CCTmuxService):
     def _resolve_chat_target(self, messages, metadata):
         return "cc-tmux-demo", "do work", {}
@@ -892,6 +956,53 @@ def test_session_event_stream_formats_status_delta_and_decision():
     assert events[1] == 'event: capture_delta\ndata: {"text": "hello"}\n\n'
     assert 'event: decision_required\n' in events[-1]
     assert '"recommended_option": "2"' in events[-1]
+
+
+def test_openai_stream_events_waits_through_mcp_tool_activity(monkeypatch):
+    status_values = [
+        {"exists": True, "last_prompt_ready": False, "capture": "running tool"},
+        {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+        {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+    ]
+    calls = 0
+    monkeypatch.setattr("cc_tmux.server.time.sleep", lambda _seconds: None)
+
+    def status():
+        return status_values.pop(0) if status_values else status_values[-1]
+
+    def structured(offset):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "offset": 10,
+                "events": [
+                    {"type": "tool_use", "tool_use_id": "toolu_1", "name": "mcp__demo__lookup"}
+                ],
+            }
+        if calls == 2:
+            return {
+                "offset": 20,
+                "events": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}],
+            }
+        return {"offset": 30, "events": [{"type": "assistant_text", "text": "STREAM FINAL"}]}
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=status,
+            structured_events_func=structured,
+            interval=0,
+            timeout=5,
+            sleep=lambda _seconds: None,
+        )
+    )
+
+    combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert combined == "STREAM FINAL"
+    assert calls == 3
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_openai_stream_events_without_log_text_emits_clean_non_empty_diagnostic(monkeypatch):

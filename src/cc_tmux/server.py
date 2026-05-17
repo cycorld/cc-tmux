@@ -83,6 +83,71 @@ def _capture_delta(previous: str, current: str) -> str:
     return current if current != previous else ""
 
 
+class _AssistantTurnTracker:
+    """Track whether structured log events represent an unfinished tool/MCP turn."""
+
+    def __init__(self) -> None:
+        self.pending_tool_use_ids: set[str] = set()
+        self.open_tool_uses = 0
+        self.saw_tool_or_mcp_activity = False
+        self.saw_assistant_text_after_activity = False
+        self.last_usage_stop_reason: str | None = None
+
+    def update(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            event_type = str(event.get("type") or "")
+            if event_type == "tool_use":
+                self.saw_tool_or_mcp_activity = True
+                self.saw_assistant_text_after_activity = False
+                tool_use_id = event.get("tool_use_id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    self.pending_tool_use_ids.add(tool_use_id)
+                else:
+                    self.open_tool_uses += 1
+            elif event_type == "tool_result":
+                self.saw_tool_or_mcp_activity = True
+                self.saw_assistant_text_after_activity = False
+                tool_use_id = event.get("tool_use_id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    self.pending_tool_use_ids.discard(tool_use_id)
+                elif self.open_tool_uses > 0:
+                    self.open_tool_uses -= 1
+            elif event_type == "usage":
+                stop_reason = event.get("stop_reason")
+                self.last_usage_stop_reason = str(stop_reason) if stop_reason else None
+                if self.last_usage_stop_reason in {"tool_use", "pause_turn", "max_tokens"}:
+                    self.saw_tool_or_mcp_activity = True
+            elif _is_background_tool_event(event):
+                self.saw_tool_or_mcp_activity = True
+                self.saw_assistant_text_after_activity = False
+            elif event_type == "assistant_text" and event.get("text"):
+                if self.saw_tool_or_mcp_activity:
+                    self.saw_assistant_text_after_activity = True
+
+    @property
+    def has_pending_tool_use(self) -> bool:
+        return bool(self.pending_tool_use_ids) or self.open_tool_uses > 0
+
+    @property
+    def waiting_for_post_tool_assistant_text(self) -> bool:
+        return self.saw_tool_or_mcp_activity and not self.saw_assistant_text_after_activity
+
+    @property
+    def in_progress(self) -> bool:
+        return self.has_pending_tool_use or self.waiting_for_post_tool_assistant_text
+
+
+def _is_background_tool_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "").lower()
+    name = str(event.get("name") or "").lower()
+    subtype = str(event.get("subtype") or "").lower()
+    return any(
+        marker in value
+        for marker in ("mcp", "api_retry", "api_req", "tool")
+        for value in (event_type, name, subtype)
+    )
+
+
 def _model_detail(model_id: str) -> dict[str, Any]:
     model = OPENAI_MODEL_ALIASES.get(model_id)
     if model is None:
@@ -577,6 +642,8 @@ class CCTmuxService:
         """
 
         deadline = time.monotonic() + max(timeout, 0.0)
+        tracker = _AssistantTurnTracker()
+        collected_events: list[dict[str, Any]] = []
         latest: dict[str, Any] = {
             "session_id": session_id,
             "events": [],
@@ -595,7 +662,14 @@ class CCTmuxService:
                 latest = self.structured_events(session_id, offset=0)
                 offset = 0
                 baseline_log_path = str(latest_log_path)
-            if extract_final_assistant_text(latest.get("events", [])):
+                collected_events = []
+                tracker = _AssistantTurnTracker()
+            events = list(latest.get("events", []))
+            if events:
+                collected_events.extend(events)
+                tracker.update(events)
+            latest = {**latest, "events": collected_events}
+            if extract_final_assistant_text(collected_events) and not tracker.in_progress:
                 return latest
             if time.monotonic() >= deadline:
                 return latest
@@ -767,6 +841,7 @@ def openai_stream_events(
     saw_not_ready = False
     saw_ready_after_work = False
     emitted_text = False
+    turn_tracker = _AssistantTurnTracker()
     deadline = time.monotonic() + max(timeout, 0.0)
     assistant_settle_deadline: float | None = None
     emitted_text_settle_deadline: float | None = None
@@ -790,8 +865,10 @@ def openai_stream_events(
                 structured = structured_events_func(0)
                 log_offset = 0
                 baseline_log_path = str(current_log_path)
+                turn_tracker = _AssistantTurnTracker()
             log_offset = int(structured.get("offset") or log_offset)
             events = structured.get("events", [])
+            turn_tracker.update(events)
             if emitted_text and events:
                 emitted_text_settle_deadline = None
             for event in events:
@@ -807,15 +884,16 @@ def openai_stream_events(
                     )
         now = time.monotonic()
         if emitted_text:
-            if saw_ready_after_work:
+            if saw_ready_after_work and not turn_tracker.in_progress:
                 break
-            if emitted_text_settle_deadline is None:
-                emitted_text_settle_deadline = now + min(
-                    stream_settle_seconds, max(0.0, deadline - now)
-                )
-            if emitted_text_settle_deadline is not None and now >= emitted_text_settle_deadline:
-                break
-        elif saw_ready_after_work:
+            if not turn_tracker.in_progress:
+                if emitted_text_settle_deadline is None:
+                    emitted_text_settle_deadline = now + min(
+                        stream_settle_seconds, max(0.0, deadline - now)
+                    )
+                if emitted_text_settle_deadline is not None and now >= emitted_text_settle_deadline:
+                    break
+        elif saw_ready_after_work and not turn_tracker.in_progress:
             if assistant_settle_deadline is None:
                 assistant_settle_deadline = now + min(3.0, max(0.0, deadline - now))
             elif now >= assistant_settle_deadline:
