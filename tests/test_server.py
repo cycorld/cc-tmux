@@ -226,6 +226,30 @@ def test_models_endpoint_openai_shape():
     }
 
 
+def test_model_detail_endpoint_supports_openai_model_aliases():
+    client, _service = make_client()
+
+    for model_id in ("claude-code", "cc-tmux/claude-code"):
+        response = client.get(f"/v1/models/{model_id}")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["id"] == model_id
+        assert payload["object"] == "model"
+        assert payload["owned_by"] == "cc-tmux"
+        assert payload["root"] == "claude-code"
+
+
+def test_harmless_discovery_endpoints_do_not_404():
+    client, _service = make_client()
+
+    for path in ("/api/v1/models", "/api/tags", "/version", "/props", "/v1/props"):
+        response = client.get(path)
+
+        assert response.status_code == 200
+        assert response.json()
+
+
 def test_v1_endpoints_are_unprotected_without_api_key():
     client = TestClient(create_app(FakeService()))
 
@@ -791,7 +815,7 @@ def test_session_event_stream_formats_status_delta_and_decision():
     assert '"recommended_option": "2"' in events[-1]
 
 
-def test_openai_stream_events_without_log_text_emits_no_tui_deltas():
+def test_openai_stream_events_without_log_text_emits_clean_non_empty_diagnostic(monkeypatch):
     statuses = iter(
         [
             {
@@ -800,7 +824,13 @@ def test_openai_stream_events_without_log_text_emits_no_tui_deltas():
                 "capture": "╭─ Claude Code ─╮\nDrizzling…",
             },
             {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+            {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
         ]
+    )
+    monotonic_values = [0.0, 0.0, 0.1, 0.1, 3.1, 3.1]
+    monkeypatch.setattr(
+        "cc_tmux.server.time.monotonic",
+        lambda: monotonic_values.pop(0) if monotonic_values else 3.1,
     )
 
     chunks = list(
@@ -815,8 +845,8 @@ def test_openai_stream_events_without_log_text_emits_no_tui_deltas():
         )
     )
 
-    assert all("content" not in chunk["choices"][0]["delta"] for chunk in chunks)
     combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert combined == "No assistant text was found in structured JSONL logs."
     for leaked in ("Claude Code", "Drizzling", "❯", "╭", "│"):
         assert leaked not in combined
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"

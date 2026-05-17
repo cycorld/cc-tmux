@@ -37,6 +37,7 @@ OPENAI_MODELS = [
     {"id": "claude-code", "object": "model", "owned_by": "cc-tmux"},
     {"id": "cc-tmux/claude-code", "object": "model", "owned_by": "cc-tmux"},
 ]
+OPENAI_MODEL_ALIASES = {model["id"]: model for model in OPENAI_MODELS}
 PLAN_APPROVAL_DECISION = {
     "id": "plan_approval",
     "kind": "plan_approval",
@@ -80,6 +81,29 @@ def _capture_delta(previous: str, current: str) -> str:
     if current.startswith(previous):
         return current[len(previous) :]
     return current if current != previous else ""
+
+
+def _model_detail(model_id: str) -> dict[str, Any]:
+    model = OPENAI_MODEL_ALIASES.get(model_id)
+    if model is None:
+        raise CCTmuxError(f"model not found: {model_id}")
+    return {
+        **model,
+        "created": 0,
+        "permission": [],
+        "root": "claude-code",
+        "parent": None,
+    }
+
+
+def _discovery_props() -> dict[str, Any]:
+    return {
+        "name": "cc-tmux",
+        "version": "0.1.0",
+        "models": [model["id"] for model in OPENAI_MODELS],
+        "chat_completions": True,
+        "streaming": True,
+    }
 
 
 class CCTmuxService:
@@ -738,7 +762,9 @@ def openai_stream_events(
     log_offset = baseline_log_offset
     saw_not_ready = False
     saw_ready_after_work = False
+    emitted_text = False
     deadline = time.monotonic() + max(timeout, 0.0)
+    assistant_settle_deadline: float | None = None
     while True:
         status = with_state(status_func())
         ready = bool(status.get("last_prompt_ready"))
@@ -761,6 +787,7 @@ def openai_stream_events(
             log_offset = int(structured.get("offset") or log_offset)
             for event in structured.get("events", []):
                 if event.get("type") == "assistant_text" and event.get("text"):
+                    emitted_text = True
                     yield _openai_stream_chunk(
                         chunk_id=chunk_id,
                         created=created,
@@ -768,11 +795,28 @@ def openai_stream_events(
                         content=str(event["text"]),
                         finish_reason=None,
                     )
+        now = time.monotonic()
         if saw_ready_after_work:
+            if emitted_text:
+                break
+            if assistant_settle_deadline is None:
+                assistant_settle_deadline = now + min(3.0, max(0.0, deadline - now))
+            elif now >= assistant_settle_deadline:
+                break
+        if now >= deadline:
             break
-        if time.monotonic() >= deadline:
-            break
-        sleep(min(max(interval, 0.0), max(0.0, deadline - time.monotonic())))
+        sleep_until = deadline
+        if assistant_settle_deadline is not None:
+            sleep_until = min(sleep_until, assistant_settle_deadline)
+        sleep(min(max(interval, 0.0), max(0.0, sleep_until - time.monotonic())))
+    if not emitted_text:
+        yield _openai_stream_chunk(
+            chunk_id=chunk_id,
+            created=created,
+            model=model,
+            content=_empty_assistant_log_message(None),
+            finish_reason=None,
+        )
     yield _openai_stream_chunk(
         chunk_id=chunk_id,
         created=created,
@@ -899,6 +943,27 @@ def create_app(service: CCTmuxService | None = None, *, api_key: str | None = No
     @app.get("/v1/models")
     def models() -> dict[str, Any]:
         return {"object": "list", "data": OPENAI_MODELS}
+
+    @app.get("/v1/models/{model_id:path}")
+    def model_detail(model_id: str) -> dict[str, Any]:
+        return _model_detail(model_id)
+
+    @app.get("/api/v1/models")
+    def api_v1_models() -> dict[str, Any]:
+        return {"object": "list", "data": OPENAI_MODELS}
+
+    @app.get("/api/tags")
+    def api_tags() -> dict[str, Any]:
+        return {"models": [{"name": model["id"], **model} for model in OPENAI_MODELS]}
+
+    @app.get("/version")
+    def version() -> dict[str, str]:
+        return {"version": "0.1.0"}
+
+    @app.get("/props")
+    @app.get("/v1/props")
+    def props() -> dict[str, Any]:
+        return _discovery_props()
 
     @app.post("/v1/sessions")
     def start_session(body: dict[str, Any]) -> dict[str, Any]:
