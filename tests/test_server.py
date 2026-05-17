@@ -645,6 +645,73 @@ def test_service_chat_completion_waits_through_tool_turn(monkeypatch):
     assert service.calls == 4
 
 
+class FakeToolResultNoAssistantCompletionService(CCTmuxService):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _resolve_chat_target(self, messages, metadata):
+        return "cc-tmux-demo", "최신 메일 확인해줘.", {}
+
+    def send_message(self, session_id, *, content, wait_ready=True, timeout_seconds=120.0):
+        return {
+            "session_id": session_id,
+            "name": session_id,
+            "session": session_id,
+            "ready": True,
+            "capture": "╭─ Claude Code ─╮\n│ ❯ prompt",
+        }
+
+    def structured_events(self, session_id, offset=0):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "session_id": session_id,
+                "offset": 100,
+                "log_path": "/tmp/fake.jsonl",
+                "events": [],
+            }
+        return {
+            "session_id": session_id,
+            "offset": 300,
+            "log_path": "/tmp/fake.jsonl",
+            "events": [
+                {"type": "tool_use", "tool_use_id": "toolu_search", "name": "ToolSearch"},
+                {"type": "usage", "stop_reason": "tool_use"},
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search",
+                    "content": (
+                        "최근 메일 2건을 찾았습니다.\n"
+                        "╭─ Claude Code ─╮\n"
+                        "1. hello@example.com"
+                    ),
+                },
+            ],
+        }
+
+
+def test_service_chat_completion_tool_result_without_assistant_text_uses_safe_fallback(monkeypatch):
+    service = FakeToolResultNoAssistantCompletionService()
+    monotonic_values = [0.0, 0.0, 3.1, 3.1]
+    monkeypatch.setattr(
+        "cc_tmux.server.time.monotonic",
+        lambda: monotonic_values.pop(0) if monotonic_values else 3.1,
+    )
+
+    payload = service.chat_completion(
+        model="cc-tmux",
+        messages=[{"role": "user", "content": "최신 메일 확인해줘."}],
+        metadata={"session": "cc-tmux-demo", "log_settle_timeout": 3},
+    )
+
+    content = payload["choices"][0]["message"]["content"]
+    assert "최근 메일 2건을 찾았습니다." in content
+    assert "No assistant text was found" not in content
+    for leaked in ("Claude Code", "❯", "╭", "│"):
+        assert leaked not in content
+    assert service.calls >= 3
+
+
 class FakeNoLogTextCompletionService(CCTmuxService):
     def _resolve_chat_target(self, messages, metadata):
         return "cc-tmux-demo", "do work", {}
@@ -1002,6 +1069,65 @@ def test_openai_stream_events_waits_through_mcp_tool_activity(monkeypatch):
     combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
     assert combined == "STREAM FINAL"
     assert calls == 3
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_openai_stream_events_tool_result_without_assistant_text_emits_safe_fallback(monkeypatch):
+    status_values = [
+        {"exists": True, "last_prompt_ready": False, "capture": "running tool"},
+        {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+        {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+    ]
+    calls = 0
+    monotonic_values = [0.0, 0.0, 0.1, 0.1, 5.1, 5.1]
+    monkeypatch.setattr(
+        "cc_tmux.server.time.monotonic",
+        lambda: monotonic_values.pop(0) if monotonic_values else 3.1,
+    )
+
+    def structured(offset):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "offset": 10,
+                "events": [
+                    {"type": "tool_use", "tool_use_id": "toolu_search", "name": "ToolSearch"},
+                    {"type": "usage", "stop_reason": "tool_use"},
+                ],
+            }
+        if calls == 2:
+            return {
+                "offset": 20,
+                "events": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_search",
+                        "content": "최근 메일 2건을 찾았습니다.\n│ ❯ prompt",
+                    }
+                ],
+            }
+        return {"offset": 20, "events": []}
+
+    chunks = list(
+        openai_stream_events(
+            model="cc-tmux",
+            session_id="cc-tmux-demo",
+            status_func=lambda: status_values.pop(0)
+            if status_values
+            else {"exists": True, "last_prompt_ready": True, "capture": "│ ❯ prompt"},
+            structured_events_func=structured,
+            interval=0,
+            timeout=5,
+            sleep=lambda _seconds: None,
+        )
+    )
+
+    combined = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+    assert "최근 메일 2건을 찾았습니다." in combined
+    assert "No assistant text was found" not in combined
+    for leaked in ("Claude Code", "❯", "╭", "│"):
+        assert leaked not in combined
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 
 

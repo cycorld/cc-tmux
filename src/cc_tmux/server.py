@@ -92,8 +92,10 @@ class _AssistantTurnTracker:
         self.saw_tool_or_mcp_activity = False
         self.saw_assistant_text_after_activity = False
         self.last_usage_stop_reason: str | None = None
+        self.events: list[dict[str, Any]] = []
 
     def update(self, events: list[dict[str, Any]]) -> None:
+        self.events.extend(events)
         for event in events:
             event_type = str(event.get("type") or "")
             if event_type == "tool_use":
@@ -598,7 +600,7 @@ class CCTmuxService:
         )
         answer = extract_final_assistant_text(structured["events"])
         if not answer:
-            answer = _empty_assistant_log_message(structured.get("log_path"))
+            answer = _assistant_log_fallback(structured["events"], structured.get("log_path"))
         now = int(time.time())
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -907,11 +909,12 @@ def openai_stream_events(
             sleep_until = min(sleep_until, emitted_text_settle_deadline)
         sleep(min(max(interval, 0.0), max(0.0, sleep_until - time.monotonic())))
     if not emitted_text:
+        fallback_events = getattr(turn_tracker, "events", [])
         yield _openai_stream_chunk(
             chunk_id=chunk_id,
             created=created,
             model=model,
-            content=_empty_assistant_log_message(None),
+            content=_assistant_log_fallback(fallback_events, None),
             finish_reason=None,
         )
     yield _openai_stream_chunk(
@@ -991,10 +994,63 @@ def _last_user_content(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _assistant_log_fallback(events: list[dict[str, Any]], log_path: Any) -> str:
+    """Return safe non-TUI content when a turn has no assistant text.
+
+    Tool/MCP turns can end with Claude Code prompt-ready immediately after a
+    ``tool_result`` without a follow-up assistant text block. In that case, avoid
+    surfacing the structured-log diagnostic to OpenAI clients; use the latest
+    sanitized tool result when available, otherwise a user-actionable message.
+    """
+
+    tool_result = _latest_tool_result_content(events)
+    if tool_result:
+        return tool_result
+    if _events_include_tool_or_mcp_activity(events):
+        return "Claude Code completed a tool call but did not emit a final assistant message."
+    return _empty_assistant_log_message(log_path)
+
+
+def _latest_tool_result_content(events: list[dict[str, Any]]) -> str:
+    for event in reversed(events):
+        if event.get("type") != "tool_result":
+            continue
+        content = _sanitize_tool_result_content(event.get("content"))
+        if content:
+            return content
+    return ""
+
+
+def _sanitize_tool_result_content(content: Any, *, max_chars: int = 4000) -> str:
+    if content is None:
+        return ""
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    text = text.replace("\x1b", "")
+    text = "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n"))
+    text = "\n".join(line for line in text.split("\n") if not _looks_like_tui_chrome(line)).strip()
+    if len(text) > max_chars:
+        return text[: max_chars - 1].rstrip() + "…"
+    return text
+
+
+def _looks_like_tui_chrome(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    tui_markers = ("Claude Code", "Drizzling", "❯", "╭", "╰", "│", "┌", "└", "─")
+    return any(marker in stripped for marker in tui_markers)
+
+
+def _events_include_tool_or_mcp_activity(events: list[dict[str, Any]]) -> bool:
+    return any(
+        event.get("type") in {"tool_use", "tool_result"} or _is_background_tool_event(event)
+        for event in events
+    )
+
+
 def _empty_assistant_log_message(log_path: Any) -> str:
     location = f" at {log_path}" if log_path else ""
     return f"No assistant text was found in structured JSONL logs{location}."
-
 
 def _authorized_bearer(authorization: str | None, api_key: str) -> bool:
     if not authorization:
